@@ -1,0 +1,9 @@
+[Unit]
+Description=Dispatch GitHub and Gitea tasks to Claude or Codex
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/yagamin/bin:/home/yagamin/.nvm/versions/node/v24.18.0/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/agent-dispatch/env
+ExecStart=/home/yagamin/bin/agent-dispatch
+TimeoutStartSec=65min

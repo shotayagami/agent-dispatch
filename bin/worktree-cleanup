@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Safely remove one merged worktree under ~/.worktrees."""
+import argparse
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+from urllib.parse import urlparse
+
+ROOT = Path.home() / '.worktrees'
+BACKUPS = Path.home() / 'backups' / 'worktree-cleanup'
+
+
+def run(args, cwd=None):
+    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, timeout=30)
+
+
+def git(path, *args):
+    result = run(['git', '-C', str(path), *args])
+    if result.returncode:
+        raise RuntimeError('git ' + args[0] + ' failed')
+    return result.stdout.strip()
+
+
+def origin_identity(url):
+    match = re.fullmatch(r'(?:https?://|ssh://[^@/]+@)([^/:]+)(?::\d+)?/([^/]+)/([^/]+?)(?:\.git)?/?', url)
+    if not match:
+        match = re.fullmatch(r'[^@/]+@([^:]+):([^/]+)/([^/]+?)(?:\.git)?', url)
+    if not match:
+        raise RuntimeError('origin URL cannot be verified')
+    return match.groups()
+
+
+def merged_pr(path, pr_url, head):
+    parsed = urlparse(pr_url)
+    match = re.fullmatch(r'/([^/]+)/([^/]+)/pull(?:s)?/(\d+)/?', parsed.path)
+    if parsed.scheme != 'https' or not parsed.hostname or not match or parsed.query or parsed.fragment:
+        raise RuntimeError('invalid PR URL')
+    owner, repo, number = match.groups()
+    host, origin_owner, origin_repo = origin_identity(git(path, 'remote', 'get-url', 'origin'))
+    if (parsed.hostname.lower(), owner, repo) != (host.lower(), origin_owner, origin_repo):
+        raise RuntimeError('PR URL does not match origin')
+    endpoint = f'repos/{owner}/{repo}/pulls/{number}'
+    if host.lower() == 'github.com':
+        result = run(['gh', 'api', endpoint])
+    else:
+        result = run(['curl', '--fail', '--silent', '--show-error', '--netrc', '--max-time', '20', f'https://{host}/api/v1/{endpoint}'])
+    if result.returncode:
+        raise RuntimeError('PR status unavailable')
+    pr = json.loads(result.stdout)
+    if not pr.get('merged_at') or pr.get('state') not in ('closed',):
+        raise RuntimeError('PR is not merged')
+    if pr.get('head', {}).get('sha') != head or pr.get('base', {}).get('ref') != 'main':
+        raise RuntimeError('PR head or base does not match the worktree and main')
+    base = pr.get('base', {}).get('repo') or {}
+    if base.get('name') != repo or (base.get('owner') or {}).get('login', '').lower() != owner.lower():
+        raise RuntimeError('PR base repository does not match origin')
+
+
+def check(path, pr_url):
+    root = ROOT.resolve(strict=True)
+    if path.is_symlink() or path.resolve(strict=True).parent != root:
+        raise RuntimeError('target must be a direct non-symlink child of ~/.worktrees')
+    path = path.resolve(strict=True)
+    entries = git(path, 'worktree', 'list', '--porcelain').split('\n\n')
+    block = next((b for b in entries if b.splitlines() and b.splitlines()[0] == 'worktree ' + str(path)), '')
+    if not block or '\nlocked' in block or '\nprunable' in block or not (path / '.git').is_file():
+        raise RuntimeError('target is not an unlocked linked worktree')
+    head = git(path, 'rev-parse', 'HEAD')
+    merged_pr(path, pr_url, head)
+    status = git(path, 'status', '--porcelain=v1', '--ignored=matching', '--untracked-files=normal').splitlines()
+    if any(not x.startswith('!! .yomiyasu/') for x in status):
+        raise RuntimeError('modified, untracked, or other ignored files exist; retain and inspect')
+    yomi = path / '.yomiyasu'
+    if status and (yomi.is_symlink() or not yomi.is_dir()):
+        raise RuntimeError('invalid .yomiyasu directory')
+    # lsof also detects open files, not just the current working directory.
+    proc = run(['lsof', '-t', '+D', str(path)])
+    if proc.returncode not in (0, 1) or proc.stderr.strip():
+        raise RuntimeError('cannot verify whether the worktree is in use')
+    if proc.stdout.strip():
+        raise RuntimeError('worktree is in use')
+    return path, head, bool(status)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Inspect a merged PR worktree; use --apply to remove it.')
+    parser.add_argument('worktree', type=Path, help='direct child of ~/.worktrees')
+    parser.add_argument('--pr', required=True, help='merged GitHub or Gitea PR URL targeting origin/main')
+    parser.add_argument('--apply', action='store_true', help='back up records and remove the worktree')
+    args = parser.parse_args()
+    try:
+        path, head, has_yomi = check(args.worktree, args.pr)
+        print(f'eligible: {path} HEAD={head[:12]} records={has_yomi}')
+        if not args.apply:
+            print('dry-run: no changes; add --apply to remove')
+            return 0
+        if has_yomi:
+            BACKUPS.mkdir(mode=0o700, parents=True, exist_ok=True)
+            stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+            archive = BACKUPS / f'{path.name}-{stamp}.tar'
+            old_umask = os.umask(0o077)
+            try:
+                fd = os.open(archive, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(fd)
+                result = run(['tar', '-C', str(path), '-cf', str(archive), '.yomiyasu'])
+                if result.returncode or run(['tar', '-C', str(path), '-df', str(archive)]).returncode:
+                    raise RuntimeError(f'backup failed or did not match: {archive}')
+            finally:
+                os.umask(old_umask)
+            print(f'backup verified: {archive}')
+        # Recheck PR, HEAD, status and open files immediately before removal.
+        current, current_head, _ = check(path, args.pr)
+        if current_head != head:
+            raise RuntimeError('HEAD changed during cleanup')
+        if has_yomi and run(['tar', '-C', str(path), '-df', str(archive)]).returncode:
+            raise RuntimeError('records changed after backup')
+        git(current, 'worktree', 'remove', str(current))
+        print('removed; branch retained')
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(f'retained: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

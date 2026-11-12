@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Snapshot and verify a dispatch-owned PR branch worktree without modifying it."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+def git(path, *args):
+    return subprocess.check_output(['git', '-C', str(path), *args], env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'})
+
+
+def snapshot(path):
+    head = git(path, 'rev-parse', 'HEAD').decode().strip()
+    status = git(path, 'status', '--porcelain=v1', '-z', '--untracked-files=all')
+    diff = git(path, 'diff', '--binary', '--no-ext-diff', 'HEAD', '--')
+    staged = git(path, 'diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--')
+    files = {}
+    names = git(path, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0')
+    for raw in filter(None, names):
+        name = os.fsdecode(raw)
+        src = path / name
+        if not src.is_file() or src.is_symlink() or not src.resolve().is_relative_to(path.resolve()):
+            raise ValueError('untracked file is not a safe regular file')
+        data = src.read_bytes()
+        files[name] = {'sha256': hashlib.sha256(data).hexdigest(), 'mode': src.stat().st_mode & 0o777}
+    return {'head': head, 'status': status.hex(), 'diff': hashlib.sha256(diff).hexdigest(),
+            'staged': hashlib.sha256(staged).hexdigest(), 'files': files}, diff
+
+
+def main():
+    mode, source, directory, expected = sys.argv[1:]
+    source, directory = Path(source), Path(directory)
+    if mode == 'capture':
+        directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+        first, diff = snapshot(source)
+        if first['head'] != expected:
+            raise ValueError('source head changed')
+        (directory / 'changes.patch').write_bytes(diff)
+        for name in first['files']:
+            dst = directory / 'untracked' / name
+            dst.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            shutil.copy2(source / name, dst, follow_symlinks=False)
+            if hashlib.sha256(dst.read_bytes()).hexdigest() != first['files'][name]['sha256']:
+                raise ValueError('untracked file changed while copying')
+        second, _ = snapshot(source)
+        if first != second:
+            raise ValueError('source changed during capture')
+        (directory / 'snapshot.json').write_text(json.dumps(first, ensure_ascii=True, sort_keys=True))
+    elif mode == 'verify':
+        recorded = json.loads((directory / 'snapshot.json').read_text())
+        current, _ = snapshot(source)
+        if current != recorded or current['head'] != expected:
+            raise ValueError('source changed after capture')
+    elif mode == 'apply':
+        recorded = json.loads((directory / 'snapshot.json').read_text())
+        patch = directory / 'changes.patch'
+        if hashlib.sha256(patch.read_bytes()).hexdigest() != recorded['diff']:
+            raise ValueError('snapshot patch changed')
+        if patch.stat().st_size:
+            subprocess.check_call(['git', '-C', str(source), 'apply', '--binary', '--', str(patch)])
+        for name, info in recorded['files'].items():
+            dst = source / name
+            if dst.exists() or dst.is_symlink() or not dst.parent.resolve().is_relative_to(source.resolve()):
+                raise ValueError('untracked destination is unsafe')
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src = directory / 'untracked' / name
+            if hashlib.sha256(src.read_bytes()).hexdigest() != info['sha256']:
+                raise ValueError('snapshot file changed')
+            shutil.copy2(src, dst, follow_symlinks=False)
+    else:
+        raise ValueError('unknown mode')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f'handoff failed: {type(exc).__name__}: {exc}', file=sys.stderr)
+        sys.exit(1)

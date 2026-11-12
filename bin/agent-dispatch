@@ -1,0 +1,487 @@
+#!/bin/bash
+# Issue のラベルを見てエージェントに作業を渡す (定期起動用)。GitHub (gh) と Gitea (tea) の両方を見る。
+# 決まり: ~/.claude/rules/agent-collaboration.md (着手・受け渡し)、~/.claude/rules/agent-autonomy.md (判断の範囲)
+#   agent:spec … Codex (Luna) が仕様を作成し、利用できなければ Codex (Terra) で再試行する。Terra も利用できなければ報告して停止する。
+#   agent:impl … Codex (Luna) が worktree で実装する。既定では利用できなければ Claude Sonnet 5.5 を使う。agent-impl-ai codex-only 中は Terra で再試行する。
+#   (agent:impl の一時的な Codex 上位モデルへの切り替えは agent-impl-ai codex-only。review は別の切り替え)
+#                この script がコミット・push・PR 作成を行い、実装していない AI がレビューする。マージは人が行う。
+#   agent:review … 利用者が作った PR を Claude がレビューする。利用できなければ Codex (読み取りのみ) を使う。
+#                  state の review-by-codex ファイルがある間は、agent:impl の後のレビューも含め、最初から Codex が行う (agent-spec-ai review-codex)。
+# エージェントには forge の道具も資格情報も渡さない。投稿・push はこの script が行う。
+# 1 回の起動で 1 件だけ処理する。拾った Issue からはラベルを外すので、二重には拾わない。
+# 使い方: agent-dispatch [--dry-run]   (--dry-run は候補を表示するだけ)
+set -u -o pipefail
+GH_OWNER="${AGENT_GH_OWNER:?AGENT_GH_OWNER に GitHub のオーナー名を設定してください}"
+GITEA_WEB="${AGENT_GITEA_WEB:?AGENT_GITEA_WEB に Gitea の URL (人に見せる側) を設定してください}"
+GITEA_GIT="${AGENT_GITEA_GIT:?AGENT_GITEA_GIT に Gitea の git / API の接続先を設定してください}"
+LABELS=(agent:spec agent:impl agent:review agent:pr-fix)
+SPEC_MODEL=gpt-6-luna
+SPEC_FALLBACK_MODEL=gpt-6.1-terra
+IMPL_MODEL=gpt-6-luna
+IMPL_FALLBACK_MODEL=gpt-6.1-terra
+CODEX_BIN="${AGENT_CODEX_BIN:-$(command -v codex || find "$HOME/.vscode-server/extensions" -type f -path '*/bin/linux-x86_64/codex' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)}"
+[[ -n $CODEX_BIN ]] && CODEX_BIN="$(readlink -f "$CODEX_BIN")"
+CLAUDE_IMPL_MODEL=claude-sonnet-5-5
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch"; mkdir -p "$STATE"
+exec 9>"$STATE/lock"; flock -n 9 || { echo "前回の実行が続いています"; exit 0; }
+DRY=0; [[ "${1:-}" == --dry-run ]] && DRY=1
+US=$'\x1f'
+
+# 候補: ラベル <US> forge <US> repo <US> 番号 <US> URL <US> タイトル
+cands() {
+  local l gk gt
+  for l in "${LABELS[@]}"; do
+    # agent:review は PR に付くラベル。検索の種別は、gh が issues / prs、Gitea が issues / pulls
+    if [[ $l == agent:review || $l == agent:pr-fix ]]; then gk=prs gt=pulls; else gk=issues gt=issues; fi
+    gh search $gk --owner "$GH_OWNER" --label "$l" --state open --limit 20 --json repository,number,url,title,labels \
+      | jq -r --arg u "$US" --arg l "$l" '.[] | select(any(.labels[]?; .name == $l)) | [$l, "github", .repository.nameWithOwner, (.number|tostring), .url, .title] | join($u)' || return 1
+    # Gitea は存在しないラベル名を指定すると絞り込みを無視して全件返すので、ラベルは手元でも確かめる
+    tea api --login gitea-home "/repos/issues/search?state=open&type=$gt&labels=$l&limit=20" \
+      | jq -r --arg u "$US" --arg w "$GITEA_WEB" --arg l "$l" --arg p "$gt" '.[] | select(any(.labels[]?; .name == $l)) | [$l, "gitea", .repository.full_name, (.number|tostring), "\($w)/\(.repository.full_name)/\($p)/\(.number)", .title] | join($u)' || return 1
+  done
+}
+CANDS="$(cands)" || { echo "候補の取得に失敗しました" >&2; exit 1; }
+echo "候補: $(printf '%s' "$CANDS" | grep -c .) 件"
+[[ -z "$CANDS" ]] && exit 0
+(( DRY )) && { printf '%s\n' "$CANDS" | tr "$US" ' '; exit 0; }
+
+# 検索の索引は遅れることがあるので (GitHub)、ラベルが今も付いているかを Issue 本体で確かめ、付いている最初の 1 件を取る
+live() {  # live <forge> <repo> <番号> <ラベル>
+  if [[ $1 == github && $4 == agent:pr-fix ]]; then gh pr view "$3" --repo "$2" --json labels,state --jq ' .state + " " + ([.labels[].name] | join(" "))'
+  elif [[ $1 == github ]]; then gh issue view "$3" --repo "$2" --json labels,state --jq '.state + " " + ([.labels[].name] | join(" "))'
+  else tea api --login gitea-home "/repos/$2/issues/$3" | jq -er '.state + " " + ([.labels[].name] | join(" "))'; fi \
+    | grep -Eiq "^open( .*)? $4( |\$)"
+}
+LABEL=""
+while IFS="$US" read -r l f r n u t; do
+  if live "$f" "$r" "$n" "$l"; then LABEL=$l FORGE=$f REPO=$r NUM=$n URL=$u TITLE=$t; break; fi
+  echo "飛ばす (ラベルが既に無い): $r#$n"
+done <<<"$CANDS"
+[[ -n "$LABEL" ]] || exit 0
+IMPL_CODEX_ONLY="$STATE/impl-codex-only" # impl のみ Codex 内で上位モデルへ切り替える (agent-impl-ai codex-only)
+REVIEW_CODEX="$STATE/review-by-codex"   # このファイルがある間は、レビューを最初から Codex が行う。Claude へは切り替えない (agent-spec-ai review-codex)
+if [[ -e $REVIEW_CODEX ]]; then REVIEW_WHO=codex; else REVIEW_WHO=claude; fi
+case $LABEL in agent:spec) WHO='codex (spec)';; agent:review) WHO="$REVIEW_WHO (review)";; *) WHO="codex (impl)";; esac
+echo "処理: $LABEL $FORGE $REPO#$NUM $TITLE"
+WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+LOG="$STATE/$(date +%Y%m%dT%H%M%S)-${REPO//\//_}-$NUM.log"
+if [[ $FORGE == github ]]; then GITURL="git@github.com:$REPO.git"; else GITURL="$GITEA_GIT/$REPO.git"; fi
+
+comment() {  # comment <本文ファイル> [番号]   (Gitea の PR も Issue と同じ番号空間なので同じ道具で書ける)
+  local n="${2:-$NUM}"
+  if [[ $FORGE == github ]]; then gh issue comment "$n" --repo "$REPO" --body-file "$1" >/dev/null 2>&1 || gh pr comment "$n" --repo "$REPO" --body-file "$1" >/dev/null
+  else tea comment --login gitea-home --repo "$REPO" "$n" "$(cat "$1")" >/dev/null; fi
+}
+fail() {  # fail <理由> [追記ファイル]
+  { printf '中断: %s\n\n%s\n' "$WHO" "$1"
+    [[ -n "${2:-}" && -s "${2:-}" ]] && { printf '\n'; cat "$2"; }
+    printf '\n続けるときは、原因を取り除いてから `%s` ラベルを付け直してください。\n' "$LABEL"; } > "$WORK/abort.md"
+  comment "$WORK/abort.md"; agent-notify "${LABEL#agent:} 中断: $REPO#$NUM" "$1" "$URL" || true; exit 1
+}
+
+# 着手: ラベルを外してから着手コメント (ラベルが外れた時点で次の起動は拾わない)
+if [[ $FORGE == github && $LABEL == agent:pr-fix ]]; then gh api -X DELETE "repos/$REPO/issues/$NUM/labels/agent%3Apr-fix" >/dev/null
+elif [[ $FORGE == github ]]; then gh issue edit "$NUM" --repo "$REPO" --remove-label "$LABEL" >/dev/null
+else tea issues edit --login gitea-home --repo "$REPO" --remove-labels "$LABEL" "$NUM" >/dev/null; fi || { echo "ラベルを外せませんでした" >&2; exit 1; }
+# ここから先はラベルが無いので、止められたときも中断を知らせる (systemd は TimeoutStartSec で TERM を送る)
+trap 'fail "時間切れか停止の指示で止められました。ログは cg-dev の $LOG です。"' TERM INT
+
+# Issue の本文とコメントを issue.md に書き出す (エージェントには Issue を操作する道具を渡さない)
+# 渡すのは、この script の資格情報の持ち主 (=利用者) が書いたものだけ。公開リポジトリの他人のコメントを指示として読ませない
+SKIP='(利用者以外が書いたため省略)'
+if [[ $FORGE == github ]]; then
+  ME="$(gh api user --jq .login)" || fail "GitHub のログイン名を取得できませんでした。"
+  if [[ $LABEL == agent:pr-fix ]]; then VIEW=pr; else VIEW=issue; fi
+  gh "$VIEW" view "$NUM" --repo "$REPO" --json title,body,author,comments \
+    | jq -r --arg me "$ME" --arg skip "$SKIP" '"# \(.title)\n\n\(if .author.login == $me then .body else $skip end)\n" + ([.comments[] | select(.author.login == $me) | "\n---\nコメント (\(.author.login), \(.createdAt)):\n\(.body)"] | join("\n"))' > "$WORK/issue.md"
+else
+  ME="$(tea api --login gitea-home /user | jq -er .login)" || fail "Gitea のログイン名を取得できませんでした。"
+  { tea api --login gitea-home "/repos/$REPO/issues/$NUM" | jq -r --arg me "$ME" --arg skip "$SKIP" '"# \(.title)\n\n\(if .user.login == $me then .body else $skip end)\n"'
+    tea api --login gitea-home "/repos/$REPO/issues/$NUM/comments" | jq -r --arg me "$ME" '.[] | select(.user.login == $me) | "\n---\nコメント (\(.user.login), \(.created_at)):\n\(.body)"'; } > "$WORK/issue.md"
+fi
+
+ROLE() { sed '1,/^---$/{/^---$/!d};1,/^---$/d' "$HOME/.claude/agents/$1.md"; }   # frontmatter を除いた本文
+
+# 認証・利用上限・サービス停止だけを切り替え対象にする。拒否や時間切れは迂回しない。
+unavailable() {  # unavailable <終了コード> <エラー出力>
+  local rc=$1 errors=$2
+  [[ $rc == 124 || $rc == 137 || $rc == 143 ]] && return 1
+  grep -Eiq 'permission (denied|rejected)|approval.{0,20}(denied|rejected)|safety.{0,20}(denied|rejected)|cyber_policy' "$errors" && return 1
+  [[ $rc == 126 || $rc == 127 ]] && return 0
+  grep -Eiq "usage_limit_(reached|exceeded)|subscription_sharing_usage_unavailable|rate_limit_(error|exceeded)|authentication_error|overloaded_error|server_overloaded|credit_balance_exhausted|you('|’)ve hit your ((weekly|daily|session|usage) )?limit|you have (hit|reached) your ((weekly|daily|session|usage) )?limit|usage limit (reached|exceeded)|rate limit (reached|exceeded)|not logged in|invalid api key|credit balance.{0,30}(low|insufficient)|api error: *(401|429|529)([^0-9]|$)|(^|[^0-9])(401|429|529) (unauthorized|too many requests|overloaded)" "$errors"
+}
+
+# CLI の結果とエラーを別々に扱う。正常な応答内にエラーの語があっても切り替えない。
+claude_result() {  # claude_result <timeout> <arguments...>
+  local duration=$1; shift
+  timeout "$duration" claude "$@" --output-format json >"$WORK/claude.json" 2>"$WORK/claude.stderr"
+  AI_RC=$?
+  cat "$WORK/claude.json" "$WORK/claude.stderr" >>"$LOG"
+  jq -r 'select(.is_error == true or (.type == "result" and (.result // "" | test("^(Error: )?(You.?ve hit your ((weekly|daily|session|usage) )?limit|You have (hit|reached) your ((weekly|daily|session|usage) )?limit|Usage limit (reached|exceeded))"; "i")))) | .result // .subtype // empty' "$WORK/claude.json" >"$WORK/ai-errors" 2>/dev/null || :
+  cat "$WORK/claude.stderr" >>"$WORK/ai-errors"
+  if (( AI_RC == 0 )) && jq -e '.type == "result" and .is_error == false' "$WORK/claude.json" >/dev/null 2>&1 && ! unavailable "$AI_RC" "$WORK/ai-errors"; then return 0; fi
+  return 1
+}
+
+codex_result() {  # codex_result <timeout> <arguments...>
+  local duration=$1; shift
+  timeout "$duration" "$CODEX_BIN" exec --json "$@" >"$WORK/codex.jsonl" 2>"$WORK/codex.stderr"
+  AI_RC=$?
+  cat "$WORK/codex.jsonl" "$WORK/codex.stderr" >>"$LOG"
+  jq -r 'select(.type == "error" or .type == "turn.failed") | (.message // empty), (.error.message // empty), (.error.code // empty)' "$WORK/codex.jsonl" >"$WORK/ai-errors" 2>/dev/null || :
+  cat "$WORK/codex.stderr" >>"$WORK/ai-errors"
+  (( AI_RC == 0 )) && jq -s -e 'any(.[]; .type == "turn.completed") and all(.[]; .type != "turn.failed" and .type != "error")' "$WORK/codex.jsonl" >/dev/null 2>&1
+}
+
+# 読み取りだけの Codex は MCP を読み込まず、作業ツリーと実行に必要なシステムファイルだけを読める。
+codex_readonly() {  # codex_readonly <timeout> <出力ファイル> <prompt> [モデル]
+  local duration=$1 output=$2 prompt=$3 node_bin node_root=/usr gh_bin node_key gh_entry='' git_key git_core_key codex_key
+  local -a model_args=()
+  [[ -n ${4:-} ]] && model_args=(-m "$4")
+  node_bin="$(command -v node || :)"
+  [[ -n $node_bin ]] && node_root="$(dirname "$(dirname "$(readlink -f "$node_bin")")")"
+  node_key="$(printf '%s' "$node_root" | jq -Rs .)"
+  git_key="$(printf '%s' /usr/bin/git | jq -Rs .)"
+  git_core_key="$(printf '%s' /usr/lib/git-core | jq -Rs .)"
+  codex_key="$(printf '%s' "$CODEX_BIN" | jq -Rs .)"
+  gh_bin="$(command -v gh || :)"
+  [[ -n $gh_bin ]] && gh_entry=",$(readlink -f "$gh_bin" | tr -d '\n' | jq -Rs .)=\"deny\""
+  codex_result "$duration" --ignore-user-config --ephemeral "${model_args[@]}" -c 'approval_policy="never"' \
+    -c 'shell_environment_policy.inherit="none"' -c 'web_search="disabled"' \
+    -c 'shell_environment_policy.set.PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+    -c 'default_permissions="dispatch_read"' \
+    -c "permissions.dispatch_read.filesystem={\":minimal\"=\"read\",\":workspace_roots\"=\"read\",$node_key=\"read\",$git_key=\"read\",$git_core_key=\"read\",$codex_key=\"read\"$gh_entry}" \
+    -C "$PWD" -o "$output" "$prompt"
+}
+
+# 途中の実装や生成物が残っているときは別のエージェントに引き継がせない。
+clean_for_fallback() {
+  git status --porcelain=v1 --ignored=matching --untracked-files=normal -z >"$WORK/status" || return 1
+  python3 - "$WORK/status" <<'PY'
+import sys
+from pathlib import Path
+records = Path(sys.argv[1]).read_bytes().split(b'\0')
+sys.exit(0 if all(not r or r == b'!! .agent-issue.md' for r in records) else 1)
+PY
+}
+
+clean_readonly_source() {
+  git status --porcelain=v1 --ignored=matching --untracked-files=normal -z >"$WORK/status" || return 1
+  python3 - "$WORK/status" <<'PY'
+import sys
+from pathlib import Path
+allowed = {b'.agent-issue.md', b'.agent-diff.patch'}
+records = Path(sys.argv[1]).read_bytes().split(b'\0')
+sys.exit(0 if all(not r or (r[:3] in (b'?? ', b'!! ') and r[3:] in allowed) for r in records) else 1)
+PY
+}
+
+# 実装していない AI でレビューし、結果を PR に投稿する (agent:impl の後と agent:review で共有)。
+# カレントは PR の head をチェックアウトした作業ツリー。判定は REVIEW に入る。投稿できなければ戻り値 1。
+review() {  # review <PR 番号> <PR の基準ブランチ> <作業ツリーにある資料の説明>
+  git diff "origin/$2...HEAD" > .agent-diff.patch
+  local RPROMPT="作業ディレクトリは $REPO の PR #$1 の作業ツリーです。$3 .agent-diff.patch に PR の差分があります。
+差分をレビューし、結果を .agent-review.md に Write で日本語で書いてください。PR への投稿は呼び出し側が行います。
+
+- 比較の基準は origin/$2 にする (ローカルの $2 ブランチは古いことがある)。
+- 見るのは、仕様 (Issue や PR の本文) どおりか、正しく動くか (境界条件・エラー処理・既存の呼び出し元)、セキュリティ、仕様にない変更の混入。
+- 指摘は重い順に、ファイルと行、何が起きるかを具体的に書く。確かめられなかったことは推測で埋めず、その旨を書く。
+- 冒頭に「## レビュー」と見出しを付け、最後に「判定: 問題なし / 要修正」のどちらかを書く。
+- ファイルは読むだけにし、.agent-review.md 以外は作成も編集もしない。
+- Bash で実行できるのは git status / git log / git show / git grep / git diff / git ls-files / ls / cat だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は git show または cat、検索は git grep で読む。"
+  local reviewer='' codex_prompt
+  codex_prompt="${RPROMPT/結果を .agent-review.md に Write で日本語で書いてください。/結果の本文だけを日本語で最終回答として出力してください。}"
+  codex_prompt+=$'\nファイルを作成・変更せず、提示済みの .agent-diff.patch を差分の基準として読んでください。'
+  if [[ ${IMPLEMENTER:-} == claude || -e $REVIEW_CODEX ]]; then
+    if codex_readonly 8m "$PWD/.agent-review.md" "$codex_prompt" && [[ -s .agent-review.md ]]; then reviewer=codex; fi
+  else
+    if claude_result 8m -p "$RPROMPT" --model opus --restricted --strict-mcp-config \
+      --tools "Bash,Read,Grep,Glob,Write" \
+      --allowedTools "Read Grep Glob Write Bash(git log:*) Bash(git show:*) Bash(git grep:*) Bash(git diff:*) Bash(git ls-files:*) Bash(ls:*)" \
+      --permission-mode dontAsk --max-budget-usd 3 && [[ -s .agent-review.md ]]; then
+      reviewer=claude
+    elif [[ -z ${IMPLEMENTER:-} && ! -e .agent-review.md ]] && unavailable "$AI_RC" "$WORK/ai-errors" && clean_readonly_source; then
+      echo "Claude unavailable; switching review to Codex" >>"$LOG"
+      if codex_readonly 8m "$PWD/.agent-review.md" "$codex_prompt" && [[ -s .agent-review.md ]]; then reviewer=codex; fi
+    fi
+  fi
+  if [[ -z $reviewer ]]; then
+    REVIEW="独立レビューは未実施 (ログ $LOG)"; return 1
+  fi
+  printf '\n\n---\nレビュー: %s。マージは人が行います。\n' "$reviewer" >> .agent-review.md
+  [[ $reviewer == "${IMPLEMENTER:-}" ]] && printf '注意: 実装と同じ AI (%s) によるレビューで、独立レビューではありません。\n' "$reviewer" >> .agent-review.md
+  comment .agent-review.md "$1" || { REVIEW="レビューを PR に投稿できませんでした (ログ $LOG)"; return 1; }
+  REVIEW="$(grep -o '判定: *[^ ]*' .agent-review.md | tail -1)"
+}
+
+# ---------------------------------------------------------------- agent:spec
+if [[ $LABEL == agent:spec ]]; then
+  printf '着手: %s / ブランチ なし (読み取りのみ) / worktree なし\n' "$WHO" > "$WORK/claim.md"; comment "$WORK/claim.md"
+  [[ -s "$WORK/issue.md" ]] || fail "Issue の内容を取得できませんでした。"
+  git clone -q --depth 100 "$GITURL" "$WORK/repo" 2>>"$LOG" || fail "リポジトリを clone できませんでした ($GITURL)。"
+  mv "$WORK/issue.md" "$WORK/repo/.agent-issue.md"
+  cd "$WORK/repo" || exit 1
+  PROMPT="作業ディレクトリは $REPO ($FORGE) を clone したものです。.agent-issue.md に Issue $REPO#$NUM の本文とコメントがあります。
+この Issue について仕様を作り、結果を .agent-spec-comment.md に Write で書いてください。Issue への投稿は呼び出し側が行います。
+
+- ファイルは読むだけにし、.agent-spec-comment.md 以外は作成も編集もしない。
+- Bash で実行できるのは git status / git log / git show / git grep / git ls-files / ls / cat だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は git show または cat、検索は git grep で読む。
+- コメントは日本語で、次の形にする。
+  ## 仕様
+  - 決定:
+  - 根拠:
+  - 変更対象:
+  - 検証方法: (コマンドと期待値)
+  - リスクと未決事項:
+  - 次の担当: <codex|人>
+- 利用者に決めてもらう必要がある点があれば、仕様のあとに次の節を足す。
+  ## 判断待ち
+  - 操作:
+  - 必要な理由:
+  - 選択肢: (推奨に「推奨」と付ける)
+  - 実行するときに測り直すこと:
+  - 待つ間に進める作業:
+- リポジトリの中で確かめられないこと (本番の状態など) は推測で埋めず、未決事項に書く。
+- 許可されていない操作が拒否されたら、言い換えて再試行せず、そのことを未決事項に書く。"
+  SPEC_AI=codex
+  CODEX_PROMPT="${PROMPT/結果を .agent-spec-comment.md に Write で書いてください。/結果の本文だけを日本語で最終回答として出力してください。}"
+  CODEX_PROMPT+=$'\nファイルを作成・変更しないでください。\n'
+  # Claude 用 agent 定義の Opus 指定は Codex のモデル選択と矛盾するため、本文の役割だけを渡す。
+  CODEX_PROMPT+="$(ROLE spec | sed '/^# 仕様策定は Opus/d')"
+  if codex_readonly 20m "$PWD/.agent-spec-comment.md" "$CODEX_PROMPT" "$SPEC_MODEL" && [[ -s .agent-spec-comment.md ]]; then
+    :
+  else
+    if [[ ! -s .agent-spec-comment.md ]]; then rm -f .agent-spec-comment.md; fi
+    if [[ -e .agent-spec-comment.md ]] || ! unavailable "$AI_RC" "$WORK/ai-errors" || ! clean_readonly_source; then
+      fail "Codex Luna が仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
+    fi
+    echo "Codex Luna unavailable; retrying specification with Codex Terra" >>"$LOG"
+    codex_readonly 20m "$PWD/.agent-spec-comment.md" "$CODEX_PROMPT" "$SPEC_FALLBACK_MODEL" && [[ -s .agent-spec-comment.md ]] \
+      || fail "Codex Luna と Codex Terra で仕様を書けませんでした (rc=$AI_RC)。Issue に中断を報告しました。ログは cg-dev の $LOG です。"
+  fi
+  printf '\n\n---\n完了: %s (spec)。実装に進めるときは `agent:impl` ラベルを付けてください。\n' "$SPEC_AI" >> .agent-spec-comment.md
+  comment .agent-spec-comment.md || fail "仕様を Issue に投稿できませんでした。"
+  if grep -q '^## 判断待ち' .agent-spec-comment.md; then agent-notify "判断待ち: $REPO#$NUM" "$TITLE" "$URL"
+  else agent-notify "仕様ができました: $REPO#$NUM" "$TITLE" "$URL"; fi
+  echo "完了: $URL"; exit 0
+fi
+
+# ---------------------------------------------------------------- agent:review
+# 利用者が作った PR の差分を読ませる。利用者以外の PR は、差分が指示として読まれうるので扱わない。
+if [[ $LABEL == agent:review ]]; then
+  printf '着手: %s (review) / ブランチ なし (読み取りのみ) / worktree なし\n' "$REVIEW_WHO" > "$WORK/claim.md"; comment "$WORK/claim.md"
+  if [[ $FORGE == github ]]; then PRJ="$(gh pr view "$NUM" --repo "$REPO" --json author,baseRefName --jq '[.author.login,.baseRefName] | join(" ")')"
+  else PRJ="$(tea api --login gitea-home "/repos/$REPO/pulls/$NUM" | jq -er '[.user.login,.base.ref] | join(" ")')"; fi || fail "PR の情報を取得できませんでした。"
+  read -r PRAUTHOR BASE <<<"$PRJ"
+  [[ "$PRAUTHOR" == "$ME" && -n "$BASE" ]] || fail "利用者 ($ME) 以外が作った PR ($PRAUTHOR) か、基準ブランチが分かりません。差分をエージェントに読ませないため、レビューしていません。"
+  git clone -q "$GITURL" "$WORK/repo" 2>>"$LOG" || fail "リポジトリを clone できませんでした ($GITURL)。"
+  mv "$WORK/issue.md" "$WORK/repo/.agent-issue.md"
+  cd "$WORK/repo" || exit 1
+  { git fetch -q origin "+refs/pull/$NUM/head:refs/heads/agent-review-pr" && git checkout -q agent-review-pr; } 2>>"$LOG" || fail "PR の head を取得できませんでした。"
+  review "$NUM" "$BASE" ".agent-issue.md に PR のタイトル・本文・コメント (利用者の名義のもの) があります。" || fail "$REVIEW"
+  agent-notify "レビューしました: $REPO#$NUM" "$TITLE / $REVIEW" "$URL"
+  echo "完了: $URL"; exit 0
+fi
+
+pr_branch_clean() {
+  python3 - "$CACHE" "$BR" "$PRHEAD" <<'PYWORKTREE'
+import subprocess, sys
+cache, branch, expected = sys.argv[1:]
+raw = subprocess.check_output(['git', '-C', cache, 'worktree', 'list', '--porcelain', '-z'])
+for record in raw.split(b'\0\0'):
+    fields = record.split(b'\0')
+    if ('branch refs/heads/' + branch).encode() in fields:
+        path = next(x[9:] for x in fields if x.startswith(b'worktree '))
+        head = subprocess.check_output([b'git', b'-C', path, b'rev-parse', b'HEAD']).strip().decode()
+        status = subprocess.check_output([b'git', b'-C', path, b'status', b'--porcelain=v1', b'-z'])
+        if status:
+            sys.exit(1)
+        if head != expected and subprocess.run([b'git', b'-C', path, b'merge-base', b'--is-ancestor', head.encode(), expected.encode()]).returncode:
+            sys.exit(1)
+PYWORKTREE
+}
+
+# ---------------------------------------------------------------- agent:impl
+# リポジトリごとに bare の clone を state に持ち、そこから ~/.worktrees に worktree を作る
+# (各リポジトリの本体の作業ツリーには触れない。worktree-cleanup は本物の worktree を前提にしている)
+PRFIX=0
+[[ $LABEL == agent:pr-fix ]] && PRFIX=1
+BR="feat/issue-$NUM"
+WT="$HOME/.worktrees/${REPO##*/}-issue-$NUM"
+(( PRFIX )) && WT="$HOME/.worktrees/${REPO##*/}-pr-$NUM"
+CACHE="$STATE/repos/${FORGE}_${REPO//\//_}.git"
+[[ -s "$WORK/issue.md" ]] || fail "Issue の内容を取得できませんでした。"
+if [[ ! -d "$CACHE" ]]; then
+  git clone -q --bare "$GITURL" "$CACHE" 2>>"$LOG" || fail "リポジトリを clone できませんでした ($GITURL)。"
+  git -C "$CACHE" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+fi
+git -C "$CACHE" fetch -q --prune origin 2>>"$LOG" || fail "git fetch に失敗しました。"
+BASE="$(git -C "$CACHE" ls-remote --symref origin HEAD | awk '/^ref:/{sub("refs/heads/","",$2); print $2}')"
+[[ -n "$BASE" ]] || fail "既定のブランチを判定できませんでした。"
+if (( PRFIX )); then
+  if [[ $FORGE == github ]]; then
+    PRMETA="$(gh pr view "$NUM" --repo "$REPO" --json author,state,headRefName,headRefOid,baseRefName,isCrossRepository --jq '[.author.login,.state,.headRefName,.headRefOid,.baseRefName,(.isCrossRepository|tostring)]|join(" ")')" || fail "PR の情報を取得できませんでした。"
+  else
+    PRMETA="$(tea api --login gitea-home "/repos/$REPO/pulls/$NUM" | jq -er '[.user.login,.state,.head.ref,.head.sha,.base.ref,(.head.repo.id != .base.repo.id|tostring)]|join(" ")')" || fail "PR の情報を取得できませんでした。"
+  fi
+  read -r PRAUTHOR PRSTATE BR PRHEAD PRBASE PRFORK <<<"$PRMETA"
+  [[ $PRAUTHOR == "$ME" && ${PRSTATE,,} == open && $PRFORK == false && $PRBASE == "$BASE" && $BR != "$BASE" && $PRHEAD =~ ^[0-9a-f]{40}$ ]] || fail "PR の所有者、状態、送信元または基準ブランチを確認できません。"
+  git check-ref-format --branch "$BR" >/dev/null 2>&1 || fail "PR のブランチ名が不正です。"
+  [[ "$(git -C "$CACHE" rev-parse "refs/remotes/origin/$BR" 2>>"$LOG")" == "$PRHEAD" ]] || fail "PR の head とリモートブランチが一致しません。"
+  PR_SOURCE=""
+  if ! pr_branch_clean; then
+    [[ $BR =~ ^feat/issue-([0-9]+)$ ]] || fail "引き継ぎ元のブランチ名を確認できません。"
+    PR_SOURCE="$HOME/.worktrees/${REPO##*/}-issue-${BASH_REMATCH[1]}"
+    [[ -d "$PR_SOURCE" && ! -L "$PR_SOURCE" && "$(git -C "$PR_SOURCE" rev-parse --path-format=absolute --git-common-dir 2>>"$LOG")" == "$(realpath "$CACHE")" && "$(git -C "$PR_SOURCE" symbolic-ref -q --short HEAD 2>>"$LOG")" == "$BR" ]] || fail "引き継ぎ元の worktree を確認できません。"
+    (umask 077; mkdir -p "$LOG.files" && "$HOME/bin/agent-dispatch-handoff" capture "$PR_SOURCE" "$LOG.files/handoff" "$PRHEAD") 2>>"$LOG" || fail "引き継ぎ元の保存に失敗しました。元の作業は保持しています。"
+  fi
+  PR_RESUME=0
+  if [[ -e "$WT" || -L "$WT" ]]; then
+    [[ -d "$WT" && ! -L "$WT" ]] || fail "PR worktree の所有元を確認できません。"
+    [[ "$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>>"$LOG")" == "$(realpath "$CACHE")" ]] || fail "PR worktree のリポジトリが一致しません。"
+    [[ "$(git -C "$WT" rev-parse HEAD 2>>"$LOG")" == "$PRHEAD" ]] && ! git -C "$WT" symbolic-ref -q HEAD >/dev/null 2>&1 || fail "PR worktree の head が一致しないかブランチがチェックアウトされています。"
+    [[ ! -e "$WT/.agent-impl-report.md" && ! -L "$WT/.agent-impl-report.md" ]] || fail "PR worktree に前回の実装報告があります。内容を保持して中断します。"
+    if [[ -e "$WT/.agent-issue.md" ]]; then
+      mkdir -p "$LOG.files" && cp -p "$WT/.agent-issue.md" "$LOG.files/previous-agent-issue.md" || fail "前回の PR 情報を保存できませんでした。"
+    fi
+    if ! (cd "$WT" && clean_for_fallback); then
+      [[ -z "$PR_SOURCE" ]] || fail "複数の worktree に途中作業があります。保持して中断します。"
+      (umask 077; "$HOME/bin/agent-dispatch-handoff" capture "$WT" "$LOG.files/pr-resume" "$PRHEAD") 2>>"$LOG" || fail "PR worktree の途中作業を保存できませんでした。"
+      "$HOME/bin/agent-dispatch-handoff" verify "$WT" "$LOG.files/pr-resume" "$PRHEAD" 2>>"$LOG" || fail "PR worktree の保存中に変更がありました。"
+      PR_RESUME=1
+    fi
+  else
+    git -C "$CACHE" worktree add -q --detach "$WT" "$PRHEAD" 2>>"$LOG" || fail "PR の worktree を作れませんでした。"
+  fi
+elif [[ -n "$(git -C "$CACHE" ls-remote --heads origin "$BR")" ]]; then
+  fail "ブランチ $BR が既にリモートにあります。別の作業と重なっていないか確かめてください。"
+elif [[ -e "$WT" || -L "$WT" ]]; then
+  [[ -d "$WT" && ! -L "$WT" && -f "$WT/.agent-issue.md" && ! -L "$WT/.agent-issue.md" ]] || fail "既存 worktree $WT の所有元を確認できません。"
+  [[ "$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>>"$LOG")" == "$(realpath "$CACHE")" ]] || fail "既存 worktree $WT は dispatcher のリポジトリに属していません。"
+  [[ "$(git -C "$WT" symbolic-ref --quiet --short HEAD 2>>"$LOG")" == "$BR" ]] || fail "既存 worktree $WT のブランチが $BR と一致しません。"
+  git -C "$WT" merge-base --is-ancestor HEAD "origin/$BASE" 2>>"$LOG" || fail "既存 worktree $WT に未確認のコミットがあります。"
+  (cd "$WT" && clean_for_fallback) || fail "既存 worktree $WT に途中の変更または生成物があります。保持したまま中断します。"
+  mkdir -p "$LOG.files" && cp -p "$WT/.agent-issue.md" "$LOG.files/previous-agent-issue.md" || fail "前回の Issue 情報を保存できませんでした。"
+else
+  git -C "$CACHE" worktree add -q -b "$BR" "$WT" "origin/$BASE" 2>>"$LOG" || fail "worktree を作れませんでした。"
+fi
+if (( PRFIX )) && [[ -n "$PR_SOURCE" ]]; then
+  "$HOME/bin/agent-dispatch-handoff" apply "$WT" "$LOG.files/handoff" "$PRHEAD" 2>>"$LOG" || fail "引き継ぎ先への適用に失敗しました。両方の worktree を保持しています。"
+  "$HOME/bin/agent-dispatch-handoff" verify "$PR_SOURCE" "$LOG.files/handoff" "$PRHEAD" 2>>"$LOG" || fail "引き継ぎ中に元の worktree が変更されました。"
+fi
+grep -qx '.agent-*' "$CACHE/info/exclude" 2>/dev/null || echo '.agent-*' >> "$CACHE/info/exclude"
+printf '着手: codex (impl) / ブランチ %s / worktree %s\n' "$BR" "$WT" > "$WORK/claim.md"; comment "$WORK/claim.md"
+mv "$WORK/issue.md" "$WT/.agent-issue.md"
+cd "$WT" || exit 1
+
+PROMPT="作業ディレクトリは $REPO ($FORGE) の worktree で、ブランチ $BR (起点は origin/$BASE) です。
+.agent-issue.md に Issue $REPO#$NUM の本文とコメントがあります。コメントにある「## 仕様」に従って実装してください。
+
+- 変更はこの作業ディレクトリの中だけで行う。コミット・push・PR 作成は呼び出し側が行うので、git の操作はしない。
+- ネットワークは使えない。依存の取得が要るテストは実行せず、そのことを報告の「検証」に書く。
+- 仕様にない変更はしない。仕様が曖昧で決められない点や、仕様に「## 判断待ち」が残っている点に掛かる変更は行わない。
+- 終わったら .agent-impl-report.md に日本語で次の形の報告を書く。PR の本文になる。
+  ## 実装の報告
+  - 変更したファイル:
+  - 検証: (コマンドと結果。落ちたときは出力をそのまま)
+  - 置いた仮定:
+  - やらなかったこと:
+  - 次の担当: <claude|人>
+  .agent- で始まる作業用ファイルは「変更したファイル」に入れない (コミットされない)。コミット・push・PR を行わなかったことも書かない。
+- 実装を進められない理由があれば、ファイルは変えずに、報告の後に「## 判断待ち」の節 (操作 / 必要な理由 / 選択肢 (推奨に「推奨」) / 実行するときに測り直すこと / 待つ間に進める作業) を書く。
+- 拒否された操作は、言い換えて再試行しない。"
+if (( PRFIX )); then
+  PROMPT="作業ディレクトリは $REPO ($FORGE) の PR #$NUM の head $PRHEAD の作業ツリーです。.agent-issue.md の PR 本文と利用者のコメントにあるレビュー指摘を修正してください。
+$PROMPT"
+  if (( PR_RESUME )); then
+    PROMPT="前回の途中変更がこの worktree に残っています。既存の変更と生成物を読み取り、破棄せずに引き継いでください。
+$PROMPT"
+  fi
+fi
+IMPLEMENTER=codex
+if codex_result 20m -m "$IMPL_MODEL" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT"; then
+  rc=0
+else
+  rc=$AI_RC
+  [[ $rc == 0 ]] && rc=1
+  if unavailable "$AI_RC" "$WORK/ai-errors" && clean_for_fallback; then
+    if [[ -e $IMPL_CODEX_ONLY ]]; then
+      echo "Codex Luna unavailable; retrying with Codex Terra; Claude fallback disabled" >>"$LOG"
+      if codex_result 20m -m "$IMPL_FALLBACK_MODEL" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT"; then
+        rc=0
+      else
+        rc=$AI_RC
+        [[ $rc == 0 ]] && rc=1
+      fi
+    else
+      echo "Codex unavailable; switching implementation to Claude" >>"$LOG"
+      IMPLEMENTER=claude; WHO='claude (impl)'
+      CLAUDE_PROMPT="$PROMPT
+
+この実行では Bash とネットワークを使えません。ファイルの読み書きだけで作業し、実行できなかった検証は報告してください。"
+      if claude_result 20m -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE impl)" --model "$CLAUDE_IMPL_MODEL" --restricted --strict-mcp-config \
+        --tools "Read,Grep,Glob,Edit,Write" --allowedTools "Read Grep Glob Edit Write" \
+        --permission-mode dontAsk --max-budget-usd 3; then rc=0; else rc=$AI_RC; [[ $rc == 0 ]] && rc=1; fi
+    fi
+  fi
+fi
+
+(( rc == 0 )) || fail "$IMPLEMENTER が実装を完了できませんでした (rc=$rc)。途中の作業を保持しました。worktree $WT とログ $LOG を確かめてください。"
+
+# 変更したファイルを名前で指定して足す (.agent-* は info/exclude で除外済み)
+git ls-files -m -o -d --exclude-standard -z | sort -zu | xargs -0r git add -- 2>>"$LOG"
+if git diff --cached --quiet; then
+  [[ -s .agent-impl-report.md ]] && cp .agent-impl-report.md "$WORK/report.md"
+  if grep -q '^## 判断待ち' "$WORK/report.md" 2>/dev/null; then
+    fail "判断待ち: $IMPLEMENTER が実装の前に決めてほしい点を挙げました。worktree $WT を保持しています。" "$WORK/report.md"
+  fi
+  fail "$IMPLEMENTER が変更を作りませんでした。worktree $WT とログ $LOG を確かめてください。" "$WORK/report.md"
+fi
+# CI の定義は push だけで secrets を使って動くので、エージェントの変更では触らせない
+WF="$(git diff --cached --name-only | grep -E '^\.(github|gitea)/workflows/')" \
+  && fail "CI の定義 ($(tr '\n' ' ' <<<"$WF")) を変える変更なので、push していません。worktree $WT を人が確かめてください。"
+[[ -s .agent-impl-report.md ]] || fail "$IMPLEMENTER が報告 (.agent-impl-report.md) を書きませんでした。worktree $WT を確かめてください。"
+
+git commit -q -m "feat: $TITLE (#$NUM)" 2>>"$LOG" || fail "コミットに失敗しました。worktree $WT を確かめてください。"
+git fetch -q origin 2>>"$LOG"
+if (( PRFIX )); then
+  if [[ $FORGE == github ]]; then
+    PRNOW="$(gh pr view "$NUM" --repo "$REPO" --json state,headRefName,headRefOid,baseRefName,isCrossRepository --jq '[.state,.headRefName,.headRefOid,.baseRefName,(.isCrossRepository|tostring)]|join(" ")')" || fail "push 前に PR の状態を確認できませんでした。"
+  else
+    PRNOW="$(tea api --login gitea-home "/repos/$REPO/pulls/$NUM" | jq -er '[.state,.head.ref,.head.sha,.base.ref,(.head.repo.id != .base.repo.id|tostring)]|join(" ")')" || fail "push 前に PR の状態を確認できませんでした。"
+  fi
+  read -r NOWSTATE NOWBR NOWHEAD NOWBASE NOWFORK <<<"$PRNOW"
+  [[ ${NOWSTATE,,} == open && $NOWBR == "$BR" && $NOWHEAD == "$PRHEAD" && $NOWBASE == "$BASE" && $NOWFORK == false ]] || fail "PR の状態または head が変わりました。push していません。"
+  if [[ -n "$PR_SOURCE" ]]; then
+    [[ "$(git -C "$PR_SOURCE" symbolic-ref -q --short HEAD 2>>"$LOG")" == "$BR" ]] && "$HOME/bin/agent-dispatch-handoff" verify "$PR_SOURCE" "$LOG.files/handoff" "$PRHEAD" 2>>"$LOG" || fail "引き継ぎ元が変更されました。push していません。"
+  else
+    pr_branch_clean || fail "PR ブランチの別 worktree に途中の変更が現れました。push していません。"
+  fi
+  git merge-base --is-ancestor "$PRHEAD" HEAD || fail "PR の更新が fast-forward ではありません。"
+  git push -q --force-with-lease="refs/heads/$BR:$PRHEAD" origin "HEAD:refs/heads/$BR" 2>>"$LOG" || fail "PR の head が変更されたか push に失敗しました。worktree $WT を保持しています。"
+  PRNUM=$NUM; PRURL=$URL
+else
+  [[ -n "$(git ls-remote --heads origin "$BR")" ]] && fail "push の直前にブランチ $BR がリモートに現れました。push していません。"
+  git push -q -u origin "$BR" 2>>"$LOG" || fail "push に失敗しました。worktree $WT を確かめてください。"
+fi
+
+{ cat .agent-impl-report.md; printf '\nCloses #%s\n' "$NUM"; } > "$WORK/pr.md"
+if (( PRFIX )); then
+  comment .agent-impl-report.md "$PRNUM" || fail "PR に実装報告を投稿できませんでした。"
+elif [[ $FORGE == github ]]; then
+  PRURL="$(gh pr create --repo "$REPO" --base "$BASE" --head "$BR" --title "$TITLE" --body-file "$WORK/pr.md" 2>>"$LOG")" || fail "PR を作れませんでした (ブランチ $BR は push 済み)。"
+  PRNUM="${PRURL##*/}"
+else
+  PRNUM="$(jq -n --arg t "$TITLE" --arg b "$(cat "$WORK/pr.md")" --arg h "$BR" --arg base "$BASE" '{title:$t, body:$b, head:$h, base:$base}' \
+    | tea api --login gitea-home -X POST "/repos/$REPO/pulls" -d @- 2>>"$LOG" | jq -er .number)" || fail "PR を作れませんでした (ブランチ $BR は push 済み)。"
+  PRURL="$GITEA_WEB/$REPO/pulls/$PRNUM"
+fi
+
+# レビュー: 実装しなかった側が差分を読み、PR にコメントする
+review "$PRNUM" "$BASE" ".agent-issue.md に Issue と仕様、.agent-impl-report.md に実装者 ($IMPLEMENTER) の報告があります。"
+
+# 作業用ファイルはログの横へ移す (worktree に残ると、マージ後の worktree-cleanup が「無視対象のファイルあり」で保留する)
+mkdir -p "$LOG.files" && mv .agent-* "$LOG.files/" 2>>"$LOG"
+printf '完了: %s (impl)。PR: %s\n%s\n' "$IMPLEMENTER" "$PRURL" "$REVIEW" > "$WORK/done.md"; comment "$WORK/done.md"
+agent-notify "PR ができました: $REPO#$NUM" "$TITLE / $REVIEW" "$PRURL"
+echo "完了: $PRURL"

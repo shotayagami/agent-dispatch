@@ -1,0 +1,16 @@
+#!/bin/bash
+# agent:impl の Codex 利用不可時の切り替え先を選ぶ。
+# 使い方: agent-impl-ai [codex-only|default|status]
+D="${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch"
+F="$D/impl-codex-only"
+case "${1:-status}" in
+  codex-only) mkdir -p "$D" && touch "$F" ;;
+  default)    rm -f "$F" ;;
+  status) ;;
+  *) echo "使い方: agent-impl-ai [codex-only|default|status]" >&2; exit 2 ;;
+esac
+if [[ -e $F ]]; then
+  echo "impl: gpt-6-luna。利用不可なら gpt-6.1-terra で再試行し、Claude へは切り替えない"
+else
+  echo "impl: gpt-6-luna。利用不可なら claude-sonnet-5-5 へ切り替える"
+fi

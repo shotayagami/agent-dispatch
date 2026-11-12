@@ -1,0 +1,14 @@
+#!/bin/bash
+# エージェントの「判断待ち」を ntfy に送る。決まりは ~/.claude/rules/agent-autonomy.md。
+# 使い方: agent-notify <タイトル> <本文> [クリック先URL]
+# トークンは ~/.env.ntfy-agent の NTFY_AGENT_TOKEN (書き込み専用ユーザー agent-notify のもの)。
+# 日本語をヘッダーに載せないよう、JSON でルート URL に送る (docs.ntfy.sh/publish の Publish as JSON)。
+[[ $# -ge 2 ]] || { echo "usage: agent-notify <title> <message> [click-url]" >&2; exit 2; }
+ENV="$HOME/.env.ntfy-agent"
+NTFY_AGENT_TOKEN="$(grep -E '^NTFY_AGENT_TOKEN=' "$ENV" 2>/dev/null | cut -d= -f2-)"
+[[ -n "$NTFY_AGENT_TOKEN" ]] || { echo "agent-notify: $ENV に NTFY_AGENT_TOKEN がありません" >&2; exit 1; }
+URL="${NTFY_AGENT_URL:?NTFY_AGENT_URL に ntfy の URL を設定してください}"
+BODY="$(jq -nc --arg topic "${NTFY_AGENT_TOPIC:-agent-decisions}" --arg t "$1" --arg m "$2" --arg c "${3:-}" \
+  '{topic:$topic, title:$t, message:$m, tags:["robot"], priority:4} + (if $c != "" then {click:$c} else {} end)')"
+curl -fsS -m 10 -o /dev/null -H "Authorization: Bearer $NTFY_AGENT_TOKEN" -H 'Content-Type: application/json' -d "$BODY" "$URL" \
+  || { echo "agent-notify: 送信に失敗しました ($URL)" >&2; exit 1; }
