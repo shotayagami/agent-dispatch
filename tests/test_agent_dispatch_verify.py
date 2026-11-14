@@ -15,6 +15,8 @@ class VerifyTest(unittest.TestCase):
 
     def test_pass(self):
         rc, rep = self.run_helper(f'## 仕様\n{F}verify\ntrue\n# comment\necho hi\n{F}\n'); self.assertEqual(rc, 0); self.assertIn('2 件中 2 件成功', rep)
+    def test_block_indented_inside_list_item(self):
+        rc, rep = self.run_helper(f'- 検証方法:\n  - 説明\n  {F}verify\n  echo hi\n  {F}\n'); self.assertEqual(rc, 0); self.assertIn('1 件中 1 件成功', rep)
     def test_fail_reports_tail(self):
         rc, rep = self.run_helper(f'{F}verify\necho boom >&2; exit 7\n{F}\n'); self.assertEqual(rc, 1); self.assertIn('終了コード 7', rep); self.assertIn('boom', rep)
     def test_no_block_is_not_a_pass(self):
