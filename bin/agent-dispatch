@@ -58,6 +58,18 @@ while IFS="$US" read -r l f r n u t; do
   echo "飛ばす (ラベルが既に無い): $r#$n"
 done <<<"$CANDS"
 [[ -n "$LABEL" ]] || exit 0
+# 1 日の上限: AI の起動回数 (impl の検証失敗後の再実装も 1 回に数える) が上限に達したら、ラベルを外さずに止める。翌日に自動で再開する。
+# shortcut: 回数だけを数える (金額は数えない)。Claude 経路は 1 回 3 ドルの上限があり、Codex の費用はここから見えない。
+USAGE="$STATE/usage"; mkdir -p "$USAGE"; find "$USAGE" -type f -mtime +14 -delete
+TODAY="$USAGE/$(date +%F)"; DAILY_MAX="${AGENT_DISPATCH_DAILY_MAX:-60}"
+used() { if [[ -f $TODAY ]]; then wc -l < "$TODAY"; else echo 0; fi; }
+count_use() { printf '%s %s %s#%s\n' "$(date +%T)" "$LABEL" "$REPO" "$NUM" >> "$TODAY"; }
+if (( $(used) >= DAILY_MAX )); then
+  echo "本日の上限 ($DAILY_MAX 回) に達したため止めます。ラベルは外していません: $REPO#$NUM"
+  [[ -e "$TODAY.notified" ]] || { agent-notify "agent-dispatch: 本日の上限 ($DAILY_MAX 回) に達しました" "ラベルは外していません。翌日に再開します。上限は環境変数 AGENT_DISPATCH_DAILY_MAX で変えられます。" "$URL" && : > "$TODAY.notified"; }
+  exit 0
+fi
+count_use
 IMPL_CODEX_ONLY="$STATE/impl-codex-only" # impl のみ Codex 内で上位モデルへ切り替える (agent-impl-ai codex-only)
 REVIEW_CODEX="$STATE/review-by-codex"   # このファイルがある間は、レビューを最初から Codex が行う。Claude へは切り替えない (agent-spec-ai review-codex)
 if [[ -e $REVIEW_CODEX ]]; then REVIEW_WHO=codex; else REVIEW_WHO=claude; fi
@@ -234,6 +246,7 @@ if [[ $LABEL == agent:spec ]]; then
   - 検証方法: (コマンドと期待値)
   - リスクと未決事項:
   - 次の担当: <codex|人>
+- 「検証方法」には、期待値の説明に加えて、実装後に呼び出し側が自動で実行するコマンドを \`\`\`verify の囲みに 1 行 1 コマンドで書く (終了コード 0 を成功とみなす)。ネットワークも HOME も使えない sandbox の worktree の中で動き、git は使えない。テストや lint のように、リポジトリの中だけで完結するコマンドだけにし、該当するものがなければ囲みを書かない。
 - 利用者に決めてもらう必要がある点があれば、仕様のあとに次の節を足す。
   ## 判断待ち
   - 操作:
@@ -325,7 +338,10 @@ if (( PRFIX )); then
     PRMETA="$(tea api --login gitea-home "/repos/$REPO/pulls/$NUM" | jq -er '[.user.login,.state,.head.ref,.head.sha,.base.ref,(.head.repo.id != .base.repo.id|tostring)]|join(" ")')" || fail "PR の情報を取得できませんでした。"
   fi
   read -r PRAUTHOR PRSTATE BR PRHEAD PRBASE PRFORK <<<"$PRMETA"
-  [[ $PRAUTHOR == "$ME" && ${PRSTATE,,} == open && $PRFORK == false && $PRBASE == "$BASE" && $BR != "$BASE" && $PRHEAD =~ ^[0-9a-f]{40}$ ]] || fail "PR の所有者、状態、送信元または基準ブランチを確認できません。"
+  [[ $PRAUTHOR == "$ME" && ${PRSTATE,,} == open && $PRFORK == false && $BR != "$PRBASE" && $PRHEAD =~ ^[0-9a-f]{40}$ ]] || fail "PR の所有者、状態、送信元または基準ブランチを確認できません。"
+  git check-ref-format --branch "$PRBASE" >/dev/null 2>&1 && git -C "$CACHE" show-ref --verify --quiet "refs/remotes/origin/$PRBASE" \
+    || fail "PR の基準ブランチ $PRBASE を origin で確認できません。"
+  BASE="$PRBASE"
   git check-ref-format --branch "$BR" >/dev/null 2>&1 || fail "PR のブランチ名が不正です。"
   [[ "$(git -C "$CACHE" rev-parse "refs/remotes/origin/$BR" 2>>"$LOG")" == "$PRHEAD" ]] || fail "PR の head とリモートブランチが一致しません。"
   PR_SOURCE=""
@@ -398,7 +414,7 @@ $PROMPT"
 $PROMPT"
   fi
 fi
-IMPLEMENTER=codex
+IMPLEMENTER=codex; IMPL_USED=$IMPL_MODEL
 if codex_result 20m -m "$IMPL_MODEL" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT"; then
   rc=0
 else
@@ -407,6 +423,7 @@ else
   if unavailable "$AI_RC" "$WORK/ai-errors" && clean_for_fallback; then
     if [[ -e $IMPL_CODEX_ONLY ]]; then
       echo "Codex Luna unavailable; retrying with Codex Terra; Claude fallback disabled" >>"$LOG"
+      IMPL_USED=$IMPL_FALLBACK_MODEL
       if codex_result 20m -m "$IMPL_FALLBACK_MODEL" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT"; then
         rc=0
       else
@@ -428,6 +445,23 @@ fi
 
 (( rc == 0 )) || fail "$IMPLEMENTER が実装を完了できませんでした (rc=$rc)。途中の作業を保持しました。worktree $WT とログ $LOG を確かめてください。"
 
+# 検証ゲート: 仕様の verify ブロックを sandbox で実行し、落ちたら実装者に直させる (agent-dispatch-verify)。
+# 終了条件を実装者の自己申告にしないため、実行はこの script が行う。
+# shortcut: 再試行は Codex だけ。Claude が実装したときは 1 回実行して結果を記録するだけ。必要になったら claude_result でも直させる。
+VERIFY_MAX=2; VERIFY_TRY=0; vrc=3; : > "$WORK/verify.md"
+if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then
+  while :; do
+    "$HOME/bin/agent-dispatch-verify" "$WT" "$WT/.agent-issue.md" "$WORK/verify.md" 2>>"$LOG"; vrc=$?
+    (( vrc == 1 && VERIFY_TRY < VERIFY_MAX )) && [[ $IMPLEMENTER == codex ]] || break
+    VERIFY_TRY=$((VERIFY_TRY + 1)); count_use; echo "検証に失敗したので実装者に直させます ($VERIFY_TRY/$VERIFY_MAX)" >>"$LOG"
+    codex_result 20m -m "$IMPL_USED" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT
+
+前回の実装は、仕様の検証コマンドで次のとおり失敗しました。作業ツリーの現在の内容を読み、原因を直してください。検証コマンドは呼び出し側が再実行します。直したら .agent-impl-report.md を最新の内容に書き直してください。
+
+$(cat "$WORK/verify.md")" || break
+  done
+fi
+
 # 変更したファイルを名前で指定して足す (.agent-* は info/exclude で除外済み)
 git ls-files -m -o -d --exclude-standard -z | sort -zu | xargs -0r git add -- 2>>"$LOG"
 if git diff --cached --quiet; then
@@ -441,6 +475,13 @@ fi
 WF="$(git diff --cached --name-only | grep -E '^\.(github|gitea)/workflows/')" \
   && fail "CI の定義 ($(tr '\n' ' ' <<<"$WF")) を変える変更なので、push していません。worktree $WT を人が確かめてください。"
 [[ -s .agent-impl-report.md ]] || fail "$IMPLEMENTER が報告 (.agent-impl-report.md) を書きませんでした。worktree $WT を確かめてください。"
+case $vrc in
+  0) VERIFY_LINE="検証: 成功 (再実装 $VERIFY_TRY 回)";;
+  1) VERIFY_LINE="検証: 失敗 (再実装 $VERIFY_TRY 回でも解消せず。人の確認が必要)";;
+  3) VERIFY_LINE="検証: 未実施 (仕様に verify ブロックがない)";;
+  *) VERIFY_LINE="検証: 検証ヘルパーが異常終了 (rc=$vrc)。ログ $LOG を確認";;
+esac
+{ printf '\n## 検証 (dispatcher が sandbox で実行)\n- %s\n\n' "$VERIFY_LINE"; cat "$WORK/verify.md"; } >> .agent-impl-report.md
 
 git commit -q -m "feat: $TITLE (#$NUM)" 2>>"$LOG" || fail "コミットに失敗しました。worktree $WT を確かめてください。"
 git fetch -q origin 2>>"$LOG"
@@ -482,6 +523,7 @@ review "$PRNUM" "$BASE" ".agent-issue.md に Issue と仕様、.agent-impl-repor
 
 # 作業用ファイルはログの横へ移す (worktree に残ると、マージ後の worktree-cleanup が「無視対象のファイルあり」で保留する)
 mkdir -p "$LOG.files" && mv .agent-* "$LOG.files/" 2>>"$LOG"
-printf '完了: %s (impl)。PR: %s\n%s\n' "$IMPLEMENTER" "$PRURL" "$REVIEW" > "$WORK/done.md"; comment "$WORK/done.md"
-agent-notify "PR ができました: $REPO#$NUM" "$TITLE / $REVIEW" "$PRURL"
+printf '完了: %s (impl)。PR: %s\n%s\n%s\n' "$IMPLEMENTER" "$PRURL" "$VERIFY_LINE" "$REVIEW" > "$WORK/done.md"; comment "$WORK/done.md"
+NOTE_TITLE="PR ができました"; (( vrc == 1 )) && NOTE_TITLE="PR ができました (検証失敗)"
+agent-notify "$NOTE_TITLE: $REPO#$NUM" "$TITLE / $VERIFY_LINE / $REVIEW" "$PRURL"
 echo "完了: $PRURL"

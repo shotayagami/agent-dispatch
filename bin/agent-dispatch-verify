@@ -1,0 +1,60 @@
+#!/usr/bin/env python3
+"""agent:impl の検証ゲート。仕様の ```verify ブロックを、ネットワークなし・HOME なしの sandbox (bwrap) で実行する。
+
+使い方: agent-dispatch-verify <worktree> <issue.md> <報告の出力先>
+  issue.md の最後の ```verify ブロックを読み、1 行 1 コマンドを worktree で順に実行する。
+  終了コード: 0 = 全件成功 / 1 = 失敗あり / 3 = verify ブロックなし (検証しなかった)
+コマンドは AI が書いた仕様の文面なので、資格情報のある HOME もネットワークも見せない。
+shortcut: worktree の .git はリポジトリ外を指すので sandbox 内の git は動かない。git が要る検証は仕様に書かない。
+"""
+import os, re, shutil, subprocess, sys
+
+MAX_COMMANDS, TIMEOUT, TAIL = 10, 300, 40
+
+
+def commands(text):
+    blocks = re.findall(r'^```verify[ \t]*\n(.*?)^```[ \t]*$', text, re.S | re.M)
+    if not blocks:
+        return None
+    return [l.strip() for l in blocks[-1].splitlines() if l.strip() and not l.lstrip().startswith('#')][:MAX_COMMANDS]
+
+
+def sandbox(worktree, cmd):
+    node = shutil.which('node')
+    binds = ['/usr', '/etc'] + ([os.path.dirname(os.path.dirname(os.path.realpath(node)))] if node else [])
+    args = ['bwrap', '--unshare-all', '--die-with-parent', '--clearenv', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+            '--symlink', 'usr/bin', '/bin', '--symlink', 'usr/lib', '/lib', '--symlink', 'usr/lib64', '/lib64', '--symlink', 'usr/sbin', '/sbin']
+    for b in binds:
+        args += ['--ro-bind-try', b, b]
+    args += ['--bind', worktree, worktree, '--chdir', worktree, '--setenv', 'HOME', '/tmp',
+             '--setenv', 'PATH', (os.path.dirname(node) + ':' if node else '') + '/usr/local/bin:/usr/bin:/bin', '--setenv', 'LANG', 'C.UTF-8',
+             'bash', '-c', cmd]
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, errors='replace', timeout=TIMEOUT)
+        return p.returncode, (p.stdout + p.stderr)
+    except subprocess.TimeoutExpired:
+        return 124, f'{TIMEOUT} 秒で打ち切りました'
+
+
+def main(worktree, issue, out):
+    cmds = commands(open(issue, encoding='utf-8').read())
+    if not cmds:
+        open(out, 'w').write('検証コマンドなし (仕様に ```verify ブロックがない)\n')
+        return 3
+    failed, lines = 0, []
+    for c in cmds:
+        rc, log = sandbox(worktree, c)
+        lines.append(f'- `{c}`: ' + ('成功' if rc == 0 else f'失敗 (終了コード {rc})'))
+        if rc:
+            failed += 1
+            tail = '\n'.join(log.rstrip().splitlines()[-TAIL:])
+            lines += ['', '```', tail, '```', '']
+    lines.insert(0, f'{len(cmds)} 件中 {len(cmds) - failed} 件成功。ネットワークなし・HOME なしの sandbox で実行。')
+    open(out, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    if len(sys.argv) != 4:
+        sys.exit('usage: agent-dispatch-verify <worktree> <issue.md> <report>')
+    sys.exit(main(*sys.argv[1:]))
