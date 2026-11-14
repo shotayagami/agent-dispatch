@@ -1,0 +1,3 @@
+# agent-detect の対象。~/.config/agent-detect/repos に写して使う。1 行 1 リポジトリ: <github|gitea> <owner/name>
+github your-github-user/your-repo
+gitea your-org/your-repo

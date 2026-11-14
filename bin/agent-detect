@@ -1,0 +1,97 @@
+#!/bin/bash
+# 仕事の検出ループ (定期起動用)。既定ブランチの CI 失敗と、放置された自分の PR を見つけ、各リポジトリに Issue を作る。
+# Issue にはラベルを付けない。agent:spec を付けるかは人が決める (agent-collaboration.md)。
+# 検出は機械的に行い、AI は使わない。2 回続けて見えたものだけを Issue にし、解消したら Issue を閉じる。
+# 決まり: ~/.claude/rules/agent-autonomy.md (Issue の作成と、自分が作った Issue を閉じることは ②)
+# 対象: ~/.config/agent-detect/repos (1 行 1 リポジトリ: "github owner/name" または "gitea owner/name")
+# 使い方: agent-detect [--dry-run]   (--dry-run は検出結果を表示するだけで、Issue も状態も変えない)
+set -u
+CONF="${AGENT_DETECT_REPOS:-$HOME/.config/agent-detect/repos}"
+STATE="${AGENT_DETECT_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agent-detect}"
+STALE_DAYS="${AGENT_DETECT_STALE_DAYS:-14}"
+TITLE_PREFIX="[agent-detect]"
+DRY=0; [[ "${1:-}" == --dry-run ]] && DRY=1
+mkdir -p "$STATE"
+exec 9>"$STATE/lock"; flock -n 9 || { echo "前回の実行がまだ動いています" >&2; exit 0; }
+
+# api <forge> <GET|POST|PATCH> <パス> [本文は stdin の JSON]。gh と tea でパスと JSON が同じ形になる REST だけを使う
+api() {
+  local forge=$1 m=$2 p=$3
+  if [[ $forge == github ]]; then
+    if [[ $m == GET ]]; then gh api "$p" </dev/null; else gh api -X "$m" "$p" --input -; fi
+  else
+    if [[ $m == GET ]]; then tea api --login gitea-home "$p" </dev/null; else tea api --login gitea-home -X "$m" "$p" -d @-; fi
+  fi
+}
+
+CUR="$STATE/current.new"; DETAIL="$STATE/detail.new"; UNSURE="$STATE/unsure.new"
+: > "$CUR"; : > "$DETAIL"; : > "$UNSURE"
+US=$'\x1f'
+# add_finding <key> <forge> <repo> <タイトル> <本文>   (本文は改行を \n で持ち、後で戻す)
+add_finding() { echo "$1" >> "$CUR"; printf '%s\n' "$1$US$2$US$3$US$4$US$5" >> "$DETAIL"; }
+
+declare -A ME
+while read -r forge repo; do
+  [[ -z "$forge" || "$forge" == \#* ]] && continue
+  [[ -n "${ME[$forge]+x}" ]] || ME[$forge]="$(api "$forge" GET /user 2>/dev/null | jq -r '.login // empty')"
+  if [[ -z "${ME[$forge]}" ]]; then echo "$forge $repo" >> "$UNSURE"; continue; fi
+
+  # 1 リポジトリ内のどれかが取れなかったら、その repo は「不明」にして Issue を閉じる判断から外す
+  branch="$(api "$forge" GET "/repos/$repo" 2>/dev/null | jq -r '.default_branch // empty')"
+  runs="$(api "$forge" GET "/repos/$repo/actions/runs?branch=$branch&event=push&per_page=5&limit=5" 2>/dev/null)"
+  prs="$(api "$forge" GET "/repos/$repo/pulls?state=open&per_page=100&limit=100" 2>/dev/null)"
+  if [[ -z "$branch" ]] || ! jq -e .workflow_runs <<<"$runs" >/dev/null 2>&1 || ! jq -e type <<<"$prs" >/dev/null 2>&1; then
+    echo "$forge $repo" >> "$UNSURE"; continue
+  fi
+
+  # 完了した最新の push の run が failure のときだけ (cancelled / skipped はビルドが消えただけなので対象外)
+  jq -r '[.workflow_runs[] | select(.status == "completed")][0] | select(.conclusion == "failure") | [.html_url, (.display_title // .name)] | join("\t")' <<<"$runs" | while IFS=$'\t' read -r url name; do
+    add_finding "ci $forge $repo $branch" "$forge" "$repo" "$TITLE_PREFIX 既定ブランチ $branch の CI が失敗しています" \
+      "既定ブランチ \`$branch\` の最新の push の CI が失敗しています。\n\n- 実行: $url\n- 名前: $name\n\n原因の調査と修正が必要です。仕様化を依頼するときは \`agent:spec\` を付けてください。"
+  done
+  jq -r --arg me "${ME[$forge]}" --argjson d "$STALE_DAYS" '.[] | select(.user.login == $me and ((now - (try (.updated_at | fromdateiso8601) catch now)) > $d * 86400)) | [.number, .html_url, .title, .updated_at] | join("\t")' <<<"$prs" | while IFS=$'\t' read -r n url title upd; do
+    add_finding "pr $forge $repo $n" "$forge" "$repo" "$TITLE_PREFIX PR #$n が $STALE_DAYS 日以上更新されていません" \
+      "PR #$n が $STALE_DAYS 日以上更新されていません。\n\n- PR: $url\n- 題名: $title\n- 最終更新: $upd\n\nマージ・修正・クローズのどれかを決める必要があります。"
+  done
+done < "$CONF"
+
+sort -u -o "$CUR" "$CUR"; touch "$STATE/current"
+PERSIST="$(comm -12 "$STATE/current" "$CUR")"
+echo "検出: $(grep -c . "$CUR") 件 / 継続: $(printf '%s' "$PERSIST" | grep -c .) 件 / 取得できなかった repo: $(grep -c . "$UNSURE") 件"
+[[ -s "$UNSURE" ]] && sed 's/^/  不明: /' "$UNSURE"
+[[ -s "$CUR" ]] && sed 's/^/  検出: /' "$CUR"
+
+created=0; closed=0; first_url=""
+# 検出が継続している repo ごとに、開いている agent-detect の Issue を引いて、作成と解消を判断する
+while read -r forge repo; do
+  [[ -z "$forge" || "$forge" == \#* ]] && continue
+  grep -qxF "$forge $repo" "$UNSURE" && continue
+  issues="$(api "$forge" GET "/repos/$repo/issues?state=open&type=issues&per_page=100&limit=100" 2>/dev/null)" || continue
+  jq -e type <<<"$issues" >/dev/null 2>&1 || continue
+  # 開いている agent-detect の Issue: 番号 TAB マーカーのキー (GitHub の issues には PR も混ざるので除く)
+  mine="$(jq -r --arg p "$TITLE_PREFIX" '.[] | select((.pull_request // null) == null and (.title | startswith($p))) | [.number, (((.body // "") | capture("<!-- agent-detect:(?<k>[^>]*?) -->")? | .k) // "")] | join("\t")' <<<"$issues")"
+  # 解消: Issue のキーが今回の検出に無ければ閉じる
+  while IFS=$'\t' read -r n key; do
+    [[ -z "$n" || -z "$key" ]] && continue
+    grep -qxF "$key" "$CUR" && continue
+    (( DRY )) && { echo "  閉じる: $forge $repo #$n ($key)"; continue; }
+    jq -nc '{body:"今回の確認で検出が解消していたため閉じます (agent-detect)。"}' | api "$forge" POST "/repos/$repo/issues/$n/comments" >/dev/null \
+      && jq -nc '{state:"closed"}' | api "$forge" PATCH "/repos/$repo/issues/$n" >/dev/null && closed=$((closed+1))
+  done <<<"$mine"
+  # 作成: 継続している検出で、まだ Issue が無いもの
+  while IFS=$'\x1f' read -r key f r title body; do
+    [[ "$f $r" == "$forge $repo" ]] || continue
+    grep -qxF "$key" <<<"$PERSIST" || continue
+    cut -f2 <<<"$mine" | grep -qxF "$key" && continue
+    (( DRY )) && { echo "  作成: $forge $repo $title"; continue; }
+    # 本文の末尾に、同じ検出を二重に作らないためのマーカーを入れる
+    url="$(jq -nc --arg t "$title" --arg b "$(printf '%b\n\n<!-- agent-detect:%s -->' "$body" "$key")" '{title:$t, body:$b}' | api "$forge" POST "/repos/$repo/issues" | jq -r '.html_url // empty')"
+    if [[ -n "$url" ]]; then created=$((created+1)); [[ -z "$first_url" ]] && first_url="$url"; else echo "Issue を作れませんでした: $forge $repo $title" >&2; fi
+  done < "$DETAIL"
+done < "$CONF"
+
+echo "作成: $created 件 / 閉じた: $closed 件"
+if (( DRY )); then rm -f "$CUR" "$DETAIL" "$UNSURE"; exit 0; fi
+mv "$CUR" "$STATE/current"; rm -f "$DETAIL" "$UNSURE"
+(( created > 0 )) && { agent-notify "agent-detect: Issue を $created 件作成" "CI 失敗または放置 PR を検出しました。ラベルは付けていません。" "$first_url" || true; }
+exit 0

@@ -1,0 +1,9 @@
+[Unit]
+Description=Detect failing CI and stale PRs, open Issues (no AI)
+
+[Service]
+Type=oneshot
+Environment=PATH=/home/yagamin/bin:/home/yagamin/.nvm/versions/node/v24.18.0/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/agent-dispatch/env
+ExecStart=/home/yagamin/bin/agent-detect
+TimeoutStartSec=15min
