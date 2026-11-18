@@ -1,6 +1,6 @@
 import json, os, pathlib, subprocess, tempfile, unittest
 
-SCRIPT = os.environ.get('DETECT_TEST_SOURCE', '/home/yagamin/bin/agent-detect')
+SCRIPT = os.environ.get('DETECT_TEST_SOURCE', str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'agent-detect'))
 # gh と tea の代役。GET は fixture のファイル (パスの / を _ にしたもの) を返し、POST/PATCH は呼ばれた内容を log に残す
 STUB = r'''#!/usr/bin/env python3
 import json, os, sys

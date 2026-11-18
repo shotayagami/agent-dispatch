@@ -1,6 +1,6 @@
 import json, os, pathlib, subprocess, tempfile, unittest
 
-SOURCE = pathlib.Path(os.environ.get('AGENT_DISPATCH_TEST_SOURCE', pathlib.Path(__file__).resolve().parents[1] / 'agent-dispatch')).read_text()
+SOURCE = pathlib.Path(os.environ.get('AGENT_DISPATCH_TEST_SOURCE', pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'agent-dispatch')).read_text()
 MOCK = r'''#!/usr/bin/python3
 import json, os, pathlib, sys
 name=pathlib.Path(sys.argv[0]).name

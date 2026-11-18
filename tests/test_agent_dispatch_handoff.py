@@ -1,6 +1,6 @@
 import os, pathlib, subprocess, tempfile, unittest
 
-HELPER=os.environ.get('HANDOFF_TEST_SOURCE','/home/yagamin/bin/agent-dispatch-handoff')
+HELPER=os.environ.get('HANDOFF_TEST_SOURCE',str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'agent-dispatch-handoff'))
 class SnapshotTest(unittest.TestCase):
  def setUp(self):
   self.temp=tempfile.TemporaryDirectory(); self.root=pathlib.Path(self.temp.name); self.src=self.root/'src'; self.src.mkdir(); self.dest=self.root/'dest'; self.snap=self.root/'snap'
