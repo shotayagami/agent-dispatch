@@ -25,7 +25,7 @@ if name=='tea':
  if url.endswith('/issues/1/comments'): print('[]'); sys.exit(0)
  if url.endswith('/issues/1'): print(json.dumps({'state':'open','labels':[{'name':label}],'user':{'login':'tester'},'title':'Test task','body':'## 仕様\nImplement the issue.'})); sys.exit(0)
  if url.endswith('/pulls/1'): print('{"user":{"login":"tester"},"base":{"ref":"main"}}'); sys.exit(0)
- if url.endswith('/pulls'): print('{"number":45}'); sys.exit(0)
+ if url.endswith('/pulls'): (state/'pr_create.json').write_text(sys.stdin.read()); print('{"number":45}'); sys.exit(0)
  sys.exit(2)
 if name=='claude':
  with (state/'claude_args.jsonl').open('a') as f: f.write(json.dumps(args)+'\n')
@@ -128,6 +128,14 @@ class DispatchTest(DispatchFixture):
   self.assertIn(str(enabled),dirs); self.assertNotIn(str(disabled),dirs); self.assertIn(str(synced),dirs); self.assertIn(str(c/'skills/packaged'),dirs)
   self.assertEqual(sorted(pathlib.Path(d).name for d in dirs if '/plugins/user-skills' in d or '/plugins/anthropic-skills' in d),['anthropic-skills','user-skills'])
   self.assertIn('--restricted',args); self.assertIn('--strict-mcp-config',args)
+ def test_base_branch_state_sets_start_point_and_pr_base(self):
+  src=self.root/'source'; self.git('push','-q','origin','main:dev',cwd=src)
+  (self.state/'agent-dispatch').mkdir(exist_ok=True); (self.state/'agent-dispatch/base-branch').write_text('gitea:other/repo main\ngitea:gitea/proj dev\n')
+  r=self.run_dispatch('impl_primary'); self.assertEqual(r.returncode,0,r.stderr)
+  self.assertEqual(json.loads((self.state/'pr_create.json').read_text())['base'],'dev')
+ def test_base_branch_missing_on_origin_stops(self):
+  (self.state/'agent-dispatch').mkdir(exist_ok=True); (self.state/'agent-dispatch/base-branch').write_text('gitea:gitea/proj no-such-branch\n')
+  r=self.run_dispatch('impl_primary'); self.assertNotEqual(r.returncode,0); self.assertIn('base-branch に書いたブランチ no-such-branch が origin にありません',self.comments())
  def test_spec_falls_back_to_codex_luna(self):
   r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna']); self.assertIn('完了: codex (spec)',self.comments())
   profile=' '.join(self.codex_args()[0]); self.assertIn('/usr/bin/git',profile); self.assertIn('/usr/lib/git-core',profile); self.assertIn('shell_environment_policy.set.PATH',profile); self.assertIn('Bash で実行できるのは',profile)

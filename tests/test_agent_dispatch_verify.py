@@ -19,6 +19,10 @@ class VerifyTest(unittest.TestCase):
         rc, rep = self.run_helper(f'- 検証方法:\n  - 説明\n  {F}verify\n  echo hi\n  {F}\n'); self.assertEqual(rc, 0); self.assertIn('1 件中 1 件成功', rep)
     def test_fail_reports_tail(self):
         rc, rep = self.run_helper(f'{F}verify\necho boom >&2; exit 7\n{F}\n'); self.assertEqual(rc, 1); self.assertIn('終了コード 7', rep); self.assertIn('boom', rep)
+    def test_only_missing_commands_is_environment_problem(self):
+        rc, rep = self.run_helper(f'{F}verify\nno-such-command-for-test\ntrue\n{F}\n'); self.assertEqual(rc, 4); self.assertIn('終了コード 127', rep)
+    def test_missing_and_real_failure_is_failure(self):
+        rc, _ = self.run_helper(f'{F}verify\nno-such-command-for-test\nexit 7\n{F}\n'); self.assertEqual(rc, 1)
     def test_no_block_is_not_a_pass(self):
         rc, rep = self.run_helper('検証方法: pytest を実行\n'); self.assertEqual(rc, 3)
     def test_last_block_wins(self):

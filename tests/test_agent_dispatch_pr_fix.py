@@ -9,19 +9,27 @@ class PRFixFixture(base.DispatchFixture):
   src=self.root/'source'; self.git('push','-q','origin','HEAD:refs/heads/feat/issue-906',cwd=src)
   self.head=self.git('rev-parse','HEAD',cwd=src).strip()
   mock=base.MOCK.replace("label='agent:review' if scenario.startswith('review') else ('agent:spec' if scenario.startswith('spec') else 'agent:impl')", "label='agent:pr-fix' if scenario.startswith('prfix') else ('agent:review' if scenario.startswith('review') else ('agent:spec' if scenario.startswith('spec') else 'agent:impl'))")
-  mock=mock.replace("if url.endswith('/pulls/1'): print('{\"user\":{\"login\":\"tester\"},\"base\":{\"ref\":\"main\"}}'); sys.exit(0)", "if url.endswith('/pulls/1'):\n  print(json.dumps({'user':{'login': 'other' if scenario=='prfix_foreign' else 'tester'},'state':'open','head':{'ref':'feat/issue-906','sha':os.environ['PR_HEAD'],'repo':{'id':1}},'base':{'ref':'main','repo':{'id':1}}})); sys.exit(0)")
+  mock=mock.replace("if url.endswith('/pulls/1'): print('{\"user\":{\"login\":\"tester\"},\"base\":{\"ref\":\"main\"}}'); sys.exit(0)", "if url.endswith('/pulls/1'):\n  print(json.dumps({'user':{'login': 'other' if scenario=='prfix_foreign' else 'tester'},'state':'open','head':{'ref':'feat/issue-906','sha':os.environ['PR_HEAD'],'repo':{'id':1}},'base':{'ref':os.environ.get('PR_BASE','main'),'repo':{'id':1}}})); sys.exit(0)")
   (self.bin/'tea').write_text(mock); (self.bin/'tea').chmod(0o755)
   codex=mock.replace('import json, os, pathlib, sys','import json, os, pathlib, sys, subprocess').replace("if name=='codex':", "if name=='codex' and scenario=='prfix_src_race':\n (state.parent/'home/.worktrees/proj-issue-906/README.md').write_text('changed during work\\n')\nif name=='codex':").replace("if name=='codex':", "if name=='codex' and scenario=='prfix_race':\n subprocess.run(['git','--git-dir='+str(state.parent/'forge/gitea/proj.git'),'update-ref','refs/heads/feat/issue-906',os.environ['PR_HEAD']+'^'],check=True)\nif name=='codex':")
   codex=codex.replace("scenario in ('impl_fallback','impl_dirty','impl_ignored','impl_denied','impl_timeout','impl_unknown')","scenario in ('impl_fallback','impl_dirty','impl_ignored','impl_denied','impl_timeout','impl_unknown','prfix_partial')").replace("if scenario=='impl_dirty': pathlib.Path('partial.txt').write_text('keep me\\n')","if scenario=='impl_dirty': pathlib.Path('partial.txt').write_text('keep me\\n')\n  if scenario=='prfix_partial': pathlib.Path('README.md').write_text('interrupted edit\\n')")
   (self.bin/'codex').write_text(codex); (self.bin/'codex').chmod(0o755)
  def run_pr(self,scenario):
-  env={'AGENT_GH_OWNER':'tester','AGENT_GITEA_WEB':'https://gitea.example.test','AGENT_GITEA_GIT':f'file://{self.root}/forge','HOME':str(self.home),'XDG_STATE_HOME':str(self.state),'PATH':str(self.bin)+':/usr/bin:/bin','MOCK_SCENARIO':scenario,'MOCK_STATE':str(self.state),'PR_HEAD':self.head,'GIT_AUTHOR_NAME':'Test','GIT_AUTHOR_EMAIL':'test@example.test','GIT_COMMITTER_NAME':'Test','GIT_COMMITTER_EMAIL':'test@example.test','GIT_CONFIG_NOSYSTEM':'1'}
+  env={'AGENT_GH_OWNER':'tester','AGENT_GITEA_WEB':'https://gitea.example.test','AGENT_GITEA_GIT':f'file://{self.root}/forge','HOME':str(self.home),'XDG_STATE_HOME':str(self.state),'PATH':str(self.bin)+':/usr/bin:/bin','MOCK_SCENARIO':scenario,'MOCK_STATE':str(self.state),'PR_HEAD':self.head,'PR_BASE':getattr(self,'pr_base','main'),'GIT_AUTHOR_NAME':'Test','GIT_AUTHOR_EMAIL':'test@example.test','GIT_COMMITTER_NAME':'Test','GIT_COMMITTER_EMAIL':'test@example.test','GIT_CONFIG_NOSYSTEM':'1'}
   return subprocess.run([str(self.script)],cwd=self.home,env=env,text=True,capture_output=True,timeout=100)
 class PRFixTest(PRFixFixture):
  def test_fix_existing_pr(self):
   r=self.run_pr('prfix_ok'); self.assertEqual(r.returncode,0,r.stderr); new=self.git('rev-parse','refs/heads/feat/issue-906',cwd=self.origin).strip(); self.assertNotEqual(new,self.head); self.git('merge-base','--is-ancestor',self.head,new,cwd=self.origin); self.assertIn('完了: codex (impl)',self.comments())
  def test_reject_foreign_pr(self):
   r=self.run_pr('prfix_foreign'); self.assertNotEqual(r.returncode,0); self.assertEqual(self.git('rev-parse','refs/heads/feat/issue-906',cwd=self.origin).strip(),self.head); self.assertNotIn('codex primary',self.calls())
+ def test_reject_pr_to_branch_other_than_default_or_configured(self):
+  self.git('push','-q','origin','main:release',cwd=self.root/'source'); self.pr_base='release'
+  r=self.run_pr('prfix_ok'); self.assertNotEqual(r.returncode,0); self.assertNotIn('codex primary',self.calls())
+  self.assertIn('PR の基準ブランチ release は、既定ブランチ (main) でも base-branch に書いたブランチでもない',self.comments())
+ def test_fix_pr_to_configured_base_branch(self):
+  self.git('push','-q','origin','main:dev',cwd=self.root/'source'); self.pr_base='dev'
+  (self.state/'agent-dispatch').mkdir(exist_ok=True); (self.state/'agent-dispatch/base-branch').write_text('gitea:gitea/proj dev\n')
+  r=self.run_pr('prfix_ok'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('完了: codex (impl)',self.comments())
  def test_reject_moved_head(self):
   self.head='a'*40; r=self.run_pr('prfix_ok'); self.assertNotEqual(r.returncode,0); self.assertNotIn('codex primary',self.calls())
 

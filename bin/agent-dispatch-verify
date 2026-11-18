@@ -3,7 +3,8 @@
 
 使い方: agent-dispatch-verify <worktree> <issue.md> <報告の出力先>
   issue.md の最後の ```verify ブロックを読み、1 行 1 コマンドを worktree で順に実行する。
-  終了コード: 0 = 全件成功 / 1 = 失敗あり / 3 = verify ブロックなし (検証しなかった)
+  終了コード: 0 = 全件成功 / 1 = 失敗あり / 3 = verify ブロックなし (検証しなかった) /
+  4 = 失敗がすべて「コマンドが無い」(終了コード 127) で、実装ではなく sandbox の環境の問題
 コマンドは AI が書いた仕様の文面なので、資格情報のある HOME もネットワークも見せない。
 shortcut: worktree の .git はリポジトリ外を指すので sandbox 内の git は動かない。git が要る検証は仕様に書かない。
 """
@@ -42,17 +43,19 @@ def main(worktree, issue, out):
     if not cmds:
         open(out, 'w').write('検証コマンドなし (仕様に ```verify ブロックがない)\n')
         return 3
-    failed, lines = 0, []
+    failed, missing, lines = 0, 0, []
     for c in cmds:
         rc, log = sandbox(worktree, c)
         lines.append(f'- `{c}`: ' + ('成功' if rc == 0 else f'失敗 (終了コード {rc})'))
         if rc:
             failed += 1
+            missing += rc == 127
             tail = '\n'.join(log.rstrip().splitlines()[-TAIL:])
             lines += ['', '```', tail, '```', '']
     lines.insert(0, f'{len(cmds)} 件中 {len(cmds) - failed} 件成功。ネットワークなし・HOME なしの sandbox で実行。')
     open(out, 'w', encoding='utf-8').write('\n'.join(lines) + '\n')
-    return 1 if failed else 0
+    # 127 だけなら再実装しても直らない (sandbox に python や lint の道具が無く、再実装が空回りしたことがある)
+    return 4 if failed and failed == missing else (1 if failed else 0)
 
 
 if __name__ == '__main__':

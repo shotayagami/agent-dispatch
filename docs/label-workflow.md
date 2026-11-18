@@ -64,9 +64,9 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 
 ### agent:impl
 
-1. リポジトリごとの bare clone（`~/.local/state/agent-dispatch/repos/`）から、`~/.worktrees/<repo>-issue-<番号>` に worktree を作る。ブランチは `feat/issue-<番号>` で、起点は既定ブランチである。同名のブランチがリモートにあれば中断する。
+1. リポジトリごとの bare clone（`~/.local/state/agent-dispatch/repos/`）から、`~/.worktrees/<repo>-issue-<番号>` に worktree を作る。ブランチは `feat/issue-<番号>` で、起点は既定ブランチである。既定ブランチ以外を起点と PR の基準にするリポジトリは、`~/.local/state/agent-dispatch/base-branch` に `<forge>:<リポジトリ> <ブランチ>` の形で 1 行ずつ書く（例: `gitea:gitea/proj dev`）。書いたブランチが origin になければ中断する。同名のブランチがリモートにあれば中断する。
 2. Codex を `workspace-write` で起動する。ネットワークは使えず、git の操作もさせない。時間は 20 分までで、Issue のコメントにある `## 仕様` に従って実装し、`.agent-impl-report.md` に報告を書く。
-3. 実装後の検証。仕様の最後の ` ```verify ` の囲みを、`agent-dispatch-verify` がネットワークなし・HOME なしの sandbox（bwrap）で順に実行する。1 コマンドは 300 秒までで、終了コード 0 を成功とみなす。失敗したら、出力の末尾を添えて Codex に最大 2 回直させ、検証をやり直す。直らなくても PR は作り、報告、完了のコメント、ntfy に「検証: 失敗」と書く。囲みがなければ「検証: 未実施」と書き、成功とは扱わない。sandbox の中では git が動かない。
+3. 実装後の検証。仕様の最後の ` ```verify ` の囲みを、`agent-dispatch-verify` がネットワークなし・HOME なしの sandbox（bwrap）で順に実行する。1 コマンドは 300 秒までで、終了コード 0 を成功とみなす。失敗したら、出力の末尾を添えて Codex に最大 2 回直させ、検証をやり直す。直らなくても PR は作り、報告、完了のコメント、ntfy に「検証: 失敗」と書く。囲みがなければ「検証: 未実施」と書き、成功とは扱わない。失敗がすべて「コマンドが無い」（終了コード 127）のときは、実装ではなく sandbox の環境の問題として Codex に直させず、「検証: 未実施」と書く。sandbox の中では git が動かない。
 4. 変更されたファイルを名前で指定して add し、`feat: <タイトル> (#番号)` でコミットして push する。PR の本文は報告に `Closes #番号` を足したものである。
 5. `.github/workflows/` か `.gitea/workflows/` を変える差分は push せずに中断する。変更が空のときも中断し、`## 判断待ち` が報告にあればそれを添える。
 6. 実装していない AI が差分をレビューして PR にコメントし、完了のコメントと ntfy で知らせる。作業用の `.agent-*` ファイルはログの横の `<ログ>.files/` に移す。
@@ -78,7 +78,7 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 - 作成者が利用者である。
 - open である。
 - fork からの PR ではない。
-- 基準ブランチが既定ブランチである。
+- 基準ブランチが、既定ブランチか、`base-branch` にそのリポジトリの行として書いたブランチである。
 - リモートのブランチ先頭が PR の head と一致している。
 
 PR 専用の worktree（`~/.worktrees/<repo>-pr-<番号>`）で、PR 本文と利用者のコメントにあるレビュー指摘を修正する。push の直前に PR の状態を測り直し、head が変わっていれば push しない。push は fast-forward のみで、`--force-with-lease` に PR の head を指定する。
