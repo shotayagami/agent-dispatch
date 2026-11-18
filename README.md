@@ -38,6 +38,8 @@ service は PATH に nvm の node の `bin` を含めています。別の環境
 | `NTFY_AGENT_URL` | ntfy の URL |
 | `NTFY_AGENT_TOPIC` | ntfy のトピック名（省略時は `agent-decisions`） |
 
+`worktree-cleanup` も `AGENT_GITEA_GIT` を読みます。Gitea の PR を確かめるとき、接続先のホストがこのホストと同じで、`~/.env` に `GITEA_API_KEY=<トークン>` の行があれば、そのトークンで API を呼びます。トークンはコマンドの引数に出さず、標準入力から curl に渡します。どちらかが無ければ、これまでどおり `~/.netrc` で認証します。
+
 ## サンプルについて
 
 `rules/` と `agents/` の中身は、運用中のものをもとに、環境固有の値を外して書き直したサンプルです。実際の運用で使っているファイルそのものではありません。
