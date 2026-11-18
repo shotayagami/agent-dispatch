@@ -1,6 +1,6 @@
 import pathlib, re, subprocess, tempfile, unittest
 # agent-dispatch の impl でコミットに入れるファイルの選び方と、CI 定義を止める検査を、script の実際の行を抜き出して試す
-SRC = pathlib.Path('/home/yagamin/bin/agent-dispatch').read_text()
+SRC = pathlib.Path(str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'agent-dispatch')).read_text()
 STAGE = next(l for l in SRC.splitlines() if l.startswith('git ls-files '))
 GUARD = re.search(r"^WF=.*?grep -E '([^']+)'", SRC, re.M).group(1)
 

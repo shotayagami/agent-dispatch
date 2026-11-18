@@ -2,7 +2,7 @@ import os, pathlib, unittest
 
 import test_agent_dispatch_fallback as base
 
-HELPER = pathlib.Path(os.environ.get('VERIFY_TEST_SOURCE', '/home/yagamin/bin/agent-dispatch-verify'))
+HELPER = pathlib.Path(os.environ.get('VERIFY_TEST_SOURCE', str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'agent-dispatch-verify')))
 VERIFY_BODY = "('## 仕様\\nImplement.' if scenario=='gate_none' else '## 仕様\\n```verify\\ntest -f fixed.txt\\n```\\n')"
 # gate_fix は、検証失敗を伝える 2 回目の実装呼び出しのときだけ fixed.txt を作る。gate_never は作らない
 MOCK = base.MOCK.replace("'body':'## 仕様\\nImplement the issue.'", "'body':" + VERIFY_BODY).replace(

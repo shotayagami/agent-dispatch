@@ -5,7 +5,7 @@ class PRFixFixture(base.DispatchFixture):
  def setUp(self):
   super().setUp()
   self.script.write_text(base.SOURCE)
-  (self.home/'bin').mkdir(exist_ok=True); (self.home/'bin/agent-dispatch-handoff').write_bytes(pathlib.Path(os.environ.get('HANDOFF_TEST_SOURCE', '/home/yagamin/bin/agent-dispatch-handoff')).read_bytes()); (self.home/'bin/agent-dispatch-handoff').chmod(0o755)
+  (self.home/'bin').mkdir(exist_ok=True); (self.home/'bin/agent-dispatch-handoff').write_bytes(pathlib.Path(os.environ.get('HANDOFF_TEST_SOURCE', str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'agent-dispatch-handoff'))).read_bytes()); (self.home/'bin/agent-dispatch-handoff').chmod(0o755)
   src=self.root/'source'; self.git('push','-q','origin','HEAD:refs/heads/feat/issue-906',cwd=src)
   self.head=self.git('rev-parse','HEAD',cwd=src).strip()
   mock=base.MOCK.replace("label='agent:review' if scenario.startswith('review') else ('agent:spec' if scenario.startswith('spec') else 'agent:impl')", "label='agent:pr-fix' if scenario.startswith('prfix') else ('agent:review' if scenario.startswith('review') else ('agent:spec' if scenario.startswith('spec') else 'agent:impl'))")

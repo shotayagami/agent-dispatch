@@ -1,6 +1,6 @@
 import importlib.machinery, importlib.util, os, pathlib, subprocess, sys, tempfile, unittest
 from unittest.mock import patch
-loader=importlib.machinery.SourceFileLoader('worktree_cleanup','/home/yagamin/bin/worktree-cleanup')
+loader=importlib.machinery.SourceFileLoader('worktree_cleanup',str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'worktree-cleanup'))
 spec=importlib.util.spec_from_loader(loader.name,loader); m=importlib.util.module_from_spec(spec); loader.exec_module(m)
 class CleanupTest(unittest.TestCase):
  def setUp(self):

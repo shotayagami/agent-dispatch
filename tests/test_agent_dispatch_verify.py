@@ -1,6 +1,6 @@
 import os, pathlib, subprocess, tempfile, unittest
 
-HELPER = os.environ.get('VERIFY_TEST_SOURCE', '/home/yagamin/bin/agent-dispatch-verify')
+HELPER = os.environ.get('VERIFY_TEST_SOURCE', str(pathlib.Path(__file__).resolve().parents[1] / 'bin' / 'agent-dispatch-verify'))
 F = '```'
 
 class VerifyTest(unittest.TestCase):
