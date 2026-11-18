@@ -1,5 +1,5 @@
 #!/bin/bash
-# agent:spec の担当は Codex Luna を優先し、利用不可なら Codex Terra で再試行する。
+# agent:spec の担当は Claude Opus を優先し、利用不可なら Codex Luna、Codex Terra の順で再試行する。
 # 使い方: agent-spec-ai [review-codex|review-claude|status]
 # レビューの担当だけを切り替える。実装の切り替えは agent-impl-ai を使う。
 D="${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch"
@@ -10,7 +10,7 @@ case "${1:-status}" in
   status) ;;
   *) echo "使い方: agent-spec-ai [review-codex|review-claude|status]" >&2; exit 2 ;;
 esac
-echo "spec: codex (gpt-6-luna。利用不可なら gpt-6.1-terra。利用できなければ報告して停止)"
+echo "spec: claude-opus-5-5。利用不可なら codex (gpt-6-luna、次に gpt-6.1-terra)。いずれも利用できなければ報告して停止"
 if [[ -e $D/impl-codex-only ]]; then
   echo "impl: gpt-6-luna。利用不可なら gpt-6.1-terra。Claude へは切り替えない"
 else

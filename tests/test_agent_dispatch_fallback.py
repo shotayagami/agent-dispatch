@@ -104,18 +104,23 @@ class DispatchFixture(unittest.TestCase):
  def claude_args(self): return [json.loads(line) for line in (self.state/'claude_args.jsonl').read_text().splitlines()]
 
 class DispatchTest(DispatchFixture):
- def test_spec_uses_codex_luna_first(self):
-  r=self.run_dispatch('spec_primary'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('完了: codex (spec)',self.comments()); self.assertNotIn('claude primary',self.calls()); args=self.codex_args()[0]; self.assertEqual(args[args.index('-m')+1],'gpt-6-luna'); profile=' '.join(args); self.assertIn('/usr/bin/git',profile); self.assertIn('/usr/lib/git-core',profile); self.assertIn('shell_environment_policy.set.PATH',profile)
- def test_spec_falls_back(self):
-  r=self.run_dispatch('spec_luna_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna','gpt-6.1-terra']); self.assertNotIn('claude primary',self.calls()); self.assertIn('完了: codex (spec)',self.comments())
+ def test_spec_uses_claude_opus_first(self):
+  r=self.run_dispatch('spec_primary'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('着手: claude (spec)',self.comments()); self.assertIn('完了: claude (spec)',self.comments()); self.assertNotIn('codex',self.calls())
+  args=self.claude_args()[0]; self.assertEqual(args[args.index('--model')+1],'claude-opus-5-5'); self.assertIn('--restricted',args); self.assertEqual(args[args.index('--tools')+1],'Read,Grep,Glob,Write')
+  prompt=args[args.index('-p')+1]; self.assertIn('Bash は使えない',prompt); self.assertNotIn('Bash で実行できるのは',prompt)
+ def test_spec_falls_back_to_codex_luna(self):
+  r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna']); self.assertIn('完了: codex (spec)',self.comments())
+  profile=' '.join(self.codex_args()[0]); self.assertIn('/usr/bin/git',profile); self.assertIn('/usr/lib/git-core',profile); self.assertIn('shell_environment_policy.set.PATH',profile); self.assertIn('Bash で実行できるのは',profile)
+ def test_spec_falls_back_to_codex_terra(self):
+  r=self.run_dispatch('spec_luna_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna','gpt-6.1-terra']); self.assertIn('完了: codex (spec)',self.comments())
  def test_spec_denial_does_not_trigger_fallback(self):
-  r=self.run_dispatch('spec_denied'); self.assertNotEqual(r.returncode,0); self.assertEqual(len(self.codex_args()),1)
+  r=self.run_dispatch('spec_denied'); self.assertNotEqual(r.returncode,0); self.assertNotIn('codex',self.calls()); self.assertIn('中断: claude (spec)',self.comments())
  def test_spec_partial_output_does_not_trigger_fallback(self):
-  r=self.run_dispatch('spec_partial'); self.assertNotEqual(r.returncode,0); self.assertEqual(len(self.codex_args()),1)
+  r=self.run_dispatch('spec_partial'); self.assertNotEqual(r.returncode,0); self.assertNotIn('codex',self.calls())
  def test_spec_with_other_changes_does_not_trigger_fallback(self):
-  r=self.run_dispatch('spec_dirty'); self.assertNotEqual(r.returncode,0); self.assertEqual(len(self.codex_args()),1)
- def test_both_providers_unavailable_stops(self):
-  r=self.run_dispatch('spec_both_fail'); self.assertNotEqual(r.returncode,0); self.assertIn('codex readonly',self.calls()); self.assertIn('中断: codex (spec)',self.comments())
+  r=self.run_dispatch('spec_dirty'); self.assertNotEqual(r.returncode,0); self.assertNotIn('codex',self.calls())
+ def test_all_providers_unavailable_stops(self):
+  r=self.run_dispatch('spec_both_fail'); self.assertNotEqual(r.returncode,0); self.assertEqual(len(self.codex_args()),2); self.assertIn('中断: codex (spec)',self.comments())
  def test_standalone_review_falls_back(self):
   r=self.run_dispatch('review_fallback'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('codex readonly',self.calls()); self.assertIn('レビュー: codex',self.comments()); self.assertNotIn('-m',self.codex_args()[0])
  def test_review_exit_zero_quota_falls_back(self):
