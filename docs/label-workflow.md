@@ -53,6 +53,7 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 - エージェントに渡す Issue の本文とコメントは、`gh` と `tea` にログインしている利用者の名義のものだけで、他人の本文は「(利用者以外が書いたため省略)」に置き換わる。
 - エージェントには forge の道具も資格情報も渡さない。コメントの投稿、コミット、push、PR の作成は `agent-dispatch` が行う。
 - Claude は `--restricted` で起動するのでユーザー設定を読まない。そこで、実行するホストの `~/.claude/settings.json` で有効にしたプラグインと、`~/.claude/plugins/synced/` のプラグイン、`~/.claude/skills/` のスキルを `--plugin-dir` で渡す。プラグインの形になっていない単体のスキルは、実行のたびに `user-skills` と `anthropic-skills` (claude.ai から同期したもの) の 2 つのプラグインにまとめる。MCP は `--strict-mcp-config` で読まず、LSP は使えるツールに含めないので使われない。スキルを呼べるよう、どの経路でも Skill ツールを渡す。
+- 読み取り専用の Codex は `--ignore-user-config` で起動し、読めるファイルを作業ツリーと実行に必要なものに限る。スキルの一覧と `~/.codex/AGENTS.md` はこの制限と関係なく渡るので、その本文を読めるよう、`~/.codex/skills`、`~/.agents/skills` と、AGENTS.md が指す `~/.claude/CLAUDE.md`、`~/.claude/rules`、`~/.claude/knowledge` の読み取りも許可する。`~/.codex/config.toml` は読まないので、そこで信頼済みにしたフックは動かない。実装の Codex はユーザー設定をそのまま読む。
 
 ### agent:spec
 

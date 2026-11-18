@@ -177,8 +177,9 @@ codex_result() {  # codex_result <timeout> <arguments...>
 }
 
 # 読み取りだけの Codex は MCP を読み込まず、作業ツリーと実行に必要なシステムファイルだけを読める。
+# スキルの一覧と ~/.codex/AGENTS.md は読み取り制限と関係なく渡るので、その本文と AGENTS.md が指す共通の指示も読めるようにする。
 codex_readonly() {  # codex_readonly <timeout> <出力ファイル> <prompt> [モデル]
-  local duration=$1 output=$2 prompt=$3 node_bin node_root=/usr gh_bin node_key gh_entry='' git_key git_core_key codex_key
+  local duration=$1 output=$2 prompt=$3 node_bin node_root=/usr gh_bin node_key gh_entry='' git_key git_core_key codex_key env_entries='' p
   local -a model_args=()
   [[ -n ${4:-} ]] && model_args=(-m "$4")
   node_bin="$(command -v node || :)"
@@ -187,13 +188,16 @@ codex_readonly() {  # codex_readonly <timeout> <出力ファイル> <prompt> [�
   git_key="$(printf '%s' /usr/bin/git | jq -Rs .)"
   git_core_key="$(printf '%s' /usr/lib/git-core | jq -Rs .)"
   codex_key="$(printf '%s' "$CODEX_BIN" | jq -Rs .)"
+  for p in "$HOME/.codex/skills" "$HOME/.agents/skills" "$HOME/.claude/CLAUDE.md" "$HOME/.claude/rules" "$HOME/.claude/knowledge"; do
+    [[ -e $p ]] && env_entries+=",$(printf '%s' "$p" | jq -Rs .)=\"read\""
+  done
   gh_bin="$(command -v gh || :)"
   [[ -n $gh_bin ]] && gh_entry=",$(readlink -f "$gh_bin" | tr -d '\n' | jq -Rs .)=\"deny\""
   codex_result "$duration" --ignore-user-config --ephemeral "${model_args[@]}" -c 'approval_policy="never"' \
     -c 'shell_environment_policy.inherit="none"' -c 'web_search="disabled"' \
     -c 'shell_environment_policy.set.PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
     -c 'default_permissions="dispatch_read"' \
-    -c "permissions.dispatch_read.filesystem={\":minimal\"=\"read\",\":workspace_roots\"=\"read\",$node_key=\"read\",$git_key=\"read\",$git_core_key=\"read\",$codex_key=\"read\"$gh_entry}" \
+    -c "permissions.dispatch_read.filesystem={\":minimal\"=\"read\",\":workspace_roots\"=\"read\",$node_key=\"read\",$git_key=\"read\",$git_core_key=\"read\",$codex_key=\"read\"$env_entries$gh_entry}" \
     -C "$PWD" -o "$output" "$prompt"
 }
 

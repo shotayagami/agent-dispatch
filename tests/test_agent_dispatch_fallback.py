@@ -130,6 +130,13 @@ class DispatchTest(DispatchFixture):
  def test_spec_falls_back_to_codex_luna(self):
   r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna']); self.assertIn('完了: codex (spec)',self.comments())
   profile=' '.join(self.codex_args()[0]); self.assertIn('/usr/bin/git',profile); self.assertIn('/usr/lib/git-core',profile); self.assertIn('shell_environment_policy.set.PATH',profile); self.assertIn('Bash で実行できるのは',profile)
+ def test_readonly_codex_can_read_skills_and_shared_instructions(self):
+  for d in ('.codex/skills/ponytail','.agents/skills/k8s','.claude/rules','.ssh'): (self.home/d).mkdir(parents=True)
+  (self.home/'.claude/CLAUDE.md').write_text('x\n')
+  r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr)
+  perm=next(a for a in self.codex_args()[0] if a.startswith('permissions.dispatch_read.filesystem='))
+  for d in ('.codex/skills','.agents/skills','.claude/CLAUDE.md','.claude/rules'): self.assertIn(json.dumps(str(self.home/d))+'="read"',perm)
+  self.assertNotIn('.claude/knowledge',perm); self.assertNotIn('.ssh',perm)
  def test_spec_falls_back_to_codex_terra(self):
   r=self.run_dispatch('spec_luna_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna','gpt-6.1-terra']); self.assertIn('完了: codex (spec)',self.comments())
  def test_spec_denial_does_not_trigger_fallback(self):
