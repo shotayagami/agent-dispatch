@@ -257,6 +257,7 @@ $SPEC_BASH
   - 選択肢: (推奨に「推奨」と付ける)
   - 実行するときに測り直すこと:
   - 待つ間に進める作業:
+- 「## 判断待ち」の節を書いたときは、「次の担当」を「人」にする。この節は呼び出し側が別のコメントとして投稿する。
 - リポジトリの中で確かめられないこと (本番の状態など) は推測で埋めず、未決事項に書く。
 - 許可されていない操作が拒否されたら、言い換えて再試行せず、そのことを未決事項に書く。"
   # Claude には Bash を渡さない。--restricted がファイル操作を作業ディレクトリに閉じ込めるが、Bash には効かないため。
@@ -290,9 +291,20 @@ $SPEC_BASH
         || fail "Claude、Codex Luna、Codex Terra のいずれでも仕様を書けませんでした (rc=$AI_RC)。Issue に中断を報告しました。ログは cg-dev の $LOG です。"
     fi
   fi
-  printf '\n\n---\n完了: %s (spec)。実装に進めるときは `agent:impl` ラベルを付けてください。\n' "$SPEC_AI" >> .agent-spec-comment.md
+  # 判断待ちは別のコメントにする。仕様の末尾の 1 行だけを見て agent:impl に進まないように、文言も分ける。
+  if grep -q '^## 判断待ち' .agent-spec-comment.md; then
+    awk '/^## 判断待ち/{d=1} d' .agent-spec-comment.md > "$WORK/decision.md"
+    awk '/^## 判断待ち/{exit} 1' .agent-spec-comment.md > "$WORK/spec.md"
+    mv "$WORK/spec.md" .agent-spec-comment.md
+    printf '\n\n---\n完了: %s (spec)。判断待ちを次のコメントに書きました。決まるまで `agent:impl` ラベルを付けないでください。\n' "$SPEC_AI" >> .agent-spec-comment.md
+    printf '\n\n---\n回答はこの Issue のコメントに書いてください。決まったら、仕様に反映してから `agent:impl` ラベルを付けてください。\n' >> "$WORK/decision.md"
+  else
+    printf '\n\n---\n完了: %s (spec)。実装に進めるときは `agent:impl` ラベルを付けてください。\n' "$SPEC_AI" >> .agent-spec-comment.md
+  fi
   comment .agent-spec-comment.md || fail "仕様を Issue に投稿できませんでした。"
-  if grep -q '^## 判断待ち' .agent-spec-comment.md; then agent-notify "判断待ち: $REPO#$NUM" "$TITLE" "$URL"
+  if [[ -s $WORK/decision.md ]]; then
+    comment "$WORK/decision.md" || fail "仕様は投稿しましたが、判断待ちを Issue に投稿できませんでした。"
+    agent-notify "判断待ち: $REPO#$NUM" "$TITLE" "$URL"
   else agent-notify "仕様ができました: $REPO#$NUM" "$TITLE" "$URL"; fi
   echo "完了: $URL"; exit 0
 fi
