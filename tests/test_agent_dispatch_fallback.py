@@ -109,16 +109,34 @@ class DispatchFixture(unittest.TestCase):
 class DispatchTest(DispatchFixture):
  def test_spec_uses_claude_opus_first(self):
   r=self.run_dispatch('spec_primary'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('着手: claude (spec)',self.comments()); self.assertIn('完了: claude (spec)',self.comments()); self.assertNotIn('codex',self.calls())
-  args=self.claude_args()[0]; self.assertEqual(args[args.index('--model')+1],'claude-opus-5-5'); self.assertIn('--restricted',args); self.assertEqual(args[args.index('--tools')+1],'Read,Grep,Glob,Write')
+  args=self.claude_args()[0]; self.assertEqual(args[args.index('--model')+1],'claude-opus-5-5'); self.assertIn('--restricted',args); self.assertEqual(args[args.index('--tools')+1],'Read,Grep,Glob,Write,Skill')
   prompt=args[args.index('-p')+1]; self.assertIn('Bash は使えない',prompt); self.assertNotIn('Bash で実行できるのは',prompt)
  def test_spec_posts_decision_as_separate_comment(self):
   r=self.run_dispatch('spec_decision'); self.assertEqual(r.returncode,0,r.stderr)
   posted=[x for x in self.comments().split('\n\x1e\n') if x.strip()]
   spec=next(x for x in posted if x.startswith('## 仕様')); decision=next(x for x in posted if x.startswith('## 判断待ち'))
   self.assertLess(posted.index(spec),posted.index(decision)); self.assertNotIn('判断待ち\n',spec.split('---')[0]); self.assertIn('付けないでください',spec); self.assertNotIn('実装に進めるときは',spec); self.assertIn('- 操作: 選ぶ',decision)
+ def test_claude_gets_this_environments_plugins(self):
+  c=self.home/'.claude'; enabled=c/'plugins/cache/m/on/1'; disabled=c/'plugins/cache/m/off/1'; synced=c/'plugins/synced/b/sp'
+  for d in (enabled,disabled,synced,c/'skills/packaged'): (d/'.claude-plugin').mkdir(parents=True); (d/'.claude-plugin/plugin.json').write_text('{}')
+  (c/'settings.json').write_text(json.dumps({'enabledPlugins':{'on@m':True,'off@m':False}}))
+  (c/'plugins/installed_plugins.json').write_text(json.dumps({'plugins':{'on@m':[{'installPath':str(enabled)}],'off@m':[{'installPath':str(disabled)}]}}))
+  for d in (c/'skills/solo',c/'skills/synced/b/doc'): d.mkdir(parents=True); (d/'SKILL.md').write_text('---\nname: x\n---\n')
+  r=self.run_dispatch('spec_primary'); self.assertEqual(r.returncode,0,r.stderr)
+  args=self.claude_args()[0]; dirs=[args[i+1] for i,a in enumerate(args) if a=='--plugin-dir']
+  self.assertIn(str(enabled),dirs); self.assertNotIn(str(disabled),dirs); self.assertIn(str(synced),dirs); self.assertIn(str(c/'skills/packaged'),dirs)
+  self.assertEqual(sorted(pathlib.Path(d).name for d in dirs if '/plugins/user-skills' in d or '/plugins/anthropic-skills' in d),['anthropic-skills','user-skills'])
+  self.assertIn('--restricted',args); self.assertIn('--strict-mcp-config',args)
  def test_spec_falls_back_to_codex_luna(self):
   r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna']); self.assertIn('完了: codex (spec)',self.comments())
   profile=' '.join(self.codex_args()[0]); self.assertIn('/usr/bin/git',profile); self.assertIn('/usr/lib/git-core',profile); self.assertIn('shell_environment_policy.set.PATH',profile); self.assertIn('Bash で実行できるのは',profile)
+ def test_readonly_codex_can_read_skills_and_shared_instructions(self):
+  for d in ('.codex/skills/ponytail','.agents/skills/k8s','.claude/rules','.ssh'): (self.home/d).mkdir(parents=True)
+  (self.home/'.claude/CLAUDE.md').write_text('x\n')
+  r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr)
+  perm=next(a for a in self.codex_args()[0] if a.startswith('permissions.dispatch_read.filesystem='))
+  for d in ('.codex/skills','.agents/skills','.claude/CLAUDE.md','.claude/rules'): self.assertIn(json.dumps(str(self.home/d))+'="read"',perm)
+  self.assertNotIn('.claude/knowledge',perm); self.assertNotIn('.ssh',perm)
  def test_spec_falls_back_to_codex_terra(self):
   r=self.run_dispatch('spec_luna_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna','gpt-6.1-terra']); self.assertIn('完了: codex (spec)',self.comments())
  def test_spec_denial_does_not_trigger_fallback(self):

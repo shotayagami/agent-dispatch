@@ -125,10 +125,39 @@ unavailable() {  # unavailable <終了コード> <エラー出力>
   grep -Eiq "usage_limit_(reached|exceeded)|subscription_sharing_usage_unavailable|rate_limit_(error|exceeded)|authentication_error|overloaded_error|server_overloaded|credit_balance_exhausted|you('|’)ve hit your ((weekly|daily|session|usage) )?limit|you have (hit|reached) your ((weekly|daily|session|usage) )?limit|usage limit (reached|exceeded)|rate limit (reached|exceeded)|not logged in|invalid api key|credit balance.{0,30}(low|insufficient)|api error: *(401|429|529)([^0-9]|$)|(^|[^0-9])(401|429|529) (unauthorized|too many requests|overloaded)" "$errors"
 }
 
+# Claude は --restricted でユーザー設定を読まないので、この環境と同じプラグインとスキルを --plugin-dir で渡す。
+# MCP は --strict-mcp-config で読まない。LSP は --tools に無いので使われない。
+claude_plugin_args() {
+  local c="$HOME/.claude" d name
+  CLAUDE_PLUGIN_ARGS=()
+  while IFS= read -r d; do [[ -d $d ]] && CLAUDE_PLUGIN_ARGS+=(--plugin-dir "$d"); done < <(
+    jq -r --slurpfile i "$c/plugins/installed_plugins.json" \
+      '.enabledPlugins // {} | to_entries[] | select(.value) | $i[0].plugins[.key][0].installPath // empty' "$c/settings.json" 2>/dev/null)
+  for d in "$c"/plugins/synced/*/*/ "$c"/skills/*/; do
+    [[ -f ${d}.claude-plugin/plugin.json ]] && CLAUDE_PLUGIN_ARGS+=(--plugin-dir "${d%/}")
+  done
+  # プラグインの形でない単体スキルは、置き場所ごとに 1 つのプラグインにまとめる (claude.ai から同期したものは anthropic-skills)。
+  for name in user-skills anthropic-skills; do
+    mkdir -p "$WORK/plugins/$name/.claude-plugin" "$WORK/plugins/$name/skills"
+    printf '{"name":"%s"}\n' "$name" > "$WORK/plugins/$name/.claude-plugin/plugin.json"
+  done
+  for d in "$c"/skills/*/; do
+    [[ -f ${d}SKILL.md && ! -f ${d}.claude-plugin/plugin.json ]] && ln -s "${d%/}" "$WORK/plugins/user-skills/skills/"
+  done
+  for d in "$c"/skills/synced/*/*/; do
+    [[ -f ${d}SKILL.md ]] && ln -s "${d%/}" "$WORK/plugins/anthropic-skills/skills/"
+  done
+  for name in user-skills anthropic-skills; do
+    [[ -n "$(ls "$WORK/plugins/$name/skills")" ]] && CLAUDE_PLUGIN_ARGS+=(--plugin-dir "$WORK/plugins/$name")
+  done
+  return 0
+}
+
 # CLI の結果とエラーを別々に扱う。正常な応答内にエラーの語があっても切り替えない。
 claude_result() {  # claude_result <timeout> <arguments...>
   local duration=$1; shift
-  timeout "$duration" claude "$@" --output-format json >"$WORK/claude.json" 2>"$WORK/claude.stderr"
+  [[ -v CLAUDE_PLUGIN_ARGS ]] || claude_plugin_args
+  timeout "$duration" claude "$@" "${CLAUDE_PLUGIN_ARGS[@]}" --output-format json >"$WORK/claude.json" 2>"$WORK/claude.stderr"
   AI_RC=$?
   cat "$WORK/claude.json" "$WORK/claude.stderr" >>"$LOG"
   jq -r 'select(.is_error == true or (.type == "result" and (.result // "" | test("^(Error: )?(You.?ve hit your ((weekly|daily|session|usage) )?limit|You have (hit|reached) your ((weekly|daily|session|usage) )?limit|Usage limit (reached|exceeded))"; "i")))) | .result // .subtype // empty' "$WORK/claude.json" >"$WORK/ai-errors" 2>/dev/null || :
@@ -148,8 +177,9 @@ codex_result() {  # codex_result <timeout> <arguments...>
 }
 
 # 読み取りだけの Codex は MCP を読み込まず、作業ツリーと実行に必要なシステムファイルだけを読める。
+# スキルの一覧と ~/.codex/AGENTS.md は読み取り制限と関係なく渡るので、その本文と AGENTS.md が指す共通の指示も読めるようにする。
 codex_readonly() {  # codex_readonly <timeout> <出力ファイル> <prompt> [モデル]
-  local duration=$1 output=$2 prompt=$3 node_bin node_root=/usr gh_bin node_key gh_entry='' git_key git_core_key codex_key
+  local duration=$1 output=$2 prompt=$3 node_bin node_root=/usr gh_bin node_key gh_entry='' git_key git_core_key codex_key env_entries='' p
   local -a model_args=()
   [[ -n ${4:-} ]] && model_args=(-m "$4")
   node_bin="$(command -v node || :)"
@@ -158,13 +188,16 @@ codex_readonly() {  # codex_readonly <timeout> <出力ファイル> <prompt> [�
   git_key="$(printf '%s' /usr/bin/git | jq -Rs .)"
   git_core_key="$(printf '%s' /usr/lib/git-core | jq -Rs .)"
   codex_key="$(printf '%s' "$CODEX_BIN" | jq -Rs .)"
+  for p in "$HOME/.codex/skills" "$HOME/.agents/skills" "$HOME/.claude/CLAUDE.md" "$HOME/.claude/rules" "$HOME/.claude/knowledge"; do
+    [[ -e $p ]] && env_entries+=",$(printf '%s' "$p" | jq -Rs .)=\"read\""
+  done
   gh_bin="$(command -v gh || :)"
   [[ -n $gh_bin ]] && gh_entry=",$(readlink -f "$gh_bin" | tr -d '\n' | jq -Rs .)=\"deny\""
   codex_result "$duration" --ignore-user-config --ephemeral "${model_args[@]}" -c 'approval_policy="never"' \
     -c 'shell_environment_policy.inherit="none"' -c 'web_search="disabled"' \
     -c 'shell_environment_policy.set.PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
     -c 'default_permissions="dispatch_read"' \
-    -c "permissions.dispatch_read.filesystem={\":minimal\"=\"read\",\":workspace_roots\"=\"read\",$node_key=\"read\",$git_key=\"read\",$git_core_key=\"read\",$codex_key=\"read\"$gh_entry}" \
+    -c "permissions.dispatch_read.filesystem={\":minimal\"=\"read\",\":workspace_roots\"=\"read\",$node_key=\"read\",$git_key=\"read\",$git_core_key=\"read\",$codex_key=\"read\"$env_entries$gh_entry}" \
     -C "$PWD" -o "$output" "$prompt"
 }
 
@@ -210,8 +243,8 @@ review() {  # review <PR 番号> <PR の基準ブランチ> <作業ツリーに�
     if codex_readonly 8m "$PWD/.agent-review.md" "$codex_prompt" && [[ -s .agent-review.md ]]; then reviewer=codex; fi
   else
     if claude_result 8m -p "$RPROMPT" --model opus --restricted --strict-mcp-config \
-      --tools "Bash,Read,Grep,Glob,Write" \
-      --allowedTools "Read Grep Glob Write Bash(git log:*) Bash(git show:*) Bash(git grep:*) Bash(git diff:*) Bash(git ls-files:*) Bash(ls:*)" \
+      --tools "Bash,Read,Grep,Glob,Write,Skill" \
+      --allowedTools "Read Grep Glob Write Skill Bash(git log:*) Bash(git show:*) Bash(git grep:*) Bash(git diff:*) Bash(git ls-files:*) Bash(ls:*)" \
       --permission-mode dontAsk --max-budget-usd 3 && [[ -s .agent-review.md ]]; then
       reviewer=claude
     elif [[ -z ${IMPLEMENTER:-} && ! -e .agent-review.md ]] && unavailable "$AI_RC" "$WORK/ai-errors" && clean_readonly_source; then
@@ -265,7 +298,7 @@ $SPEC_BASH
   # spec.md の「Edit / Write は持っていない」は、仕様を Write で書かせるこの経路と矛盾するので除く。
   SPEC_AI=claude
   if claude_result 20m -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE spec | grep -v 'Edit / Write は持っていない')" --model "$CLAUDE_SPEC_MODEL" \
-    --restricted --strict-mcp-config --tools "Read,Grep,Glob,Write" --allowedTools "Read Grep Glob Write" \
+    --restricted --strict-mcp-config --tools "Read,Grep,Glob,Write,Skill" --allowedTools "Read Grep Glob Write Skill" \
     --permission-mode dontAsk --max-budget-usd 5 && [[ -s .agent-spec-comment.md ]]; then
     :
   else
@@ -467,7 +500,7 @@ else
 
 この実行では Bash とネットワークを使えません。ファイルの読み書きだけで作業し、実行できなかった検証は報告してください。"
       if claude_result 20m -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE impl)" --model "$CLAUDE_IMPL_MODEL" --restricted --strict-mcp-config \
-        --tools "Read,Grep,Glob,Edit,Write" --allowedTools "Read Grep Glob Edit Write" \
+        --tools "Read,Grep,Glob,Edit,Write,Skill" --allowedTools "Read Grep Glob Edit Write Skill" \
         --permission-mode dontAsk --max-budget-usd 3; then rc=0; else rc=$AI_RC; [[ $rc == 0 ]] && rc=1; fi
     fi
   fi

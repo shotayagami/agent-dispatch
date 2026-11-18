@@ -52,11 +52,13 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 - ラベルを外してから「着手: …」のコメントを書く。止められた場合や失敗した場合は、「中断: …」のコメントと ntfy で知らせる。
 - エージェントに渡す Issue の本文とコメントは、`gh` と `tea` にログインしている利用者の名義のものだけで、他人の本文は「(利用者以外が書いたため省略)」に置き換わる。
 - エージェントには forge の道具も資格情報も渡さない。コメントの投稿、コミット、push、PR の作成は `agent-dispatch` が行う。
+- Claude は `--restricted` で起動するのでユーザー設定を読まない。そこで、実行するホストの `~/.claude/settings.json` で有効にしたプラグインと、`~/.claude/plugins/synced/` のプラグイン、`~/.claude/skills/` のスキルを `--plugin-dir` で渡す。プラグインの形になっていない単体のスキルは、実行のたびに `user-skills` と `anthropic-skills` (claude.ai から同期したもの) の 2 つのプラグインにまとめる。MCP は `--strict-mcp-config` で読まず、LSP は使えるツールに含めないので使われない。スキルを呼べるよう、どの経路でも Skill ツールを渡す。
+- 読み取り専用の Codex は `--ignore-user-config` で起動し、読めるファイルを作業ツリーと実行に必要なものに限る。スキルの一覧と `~/.codex/AGENTS.md` はこの制限と関係なく渡るので、その本文を読めるよう、`~/.codex/skills`、`~/.agents/skills` と、AGENTS.md が指す `~/.claude/CLAUDE.md`、`~/.claude/rules`、`~/.claude/knowledge` の読み取りも許可する。`~/.codex/config.toml` は読まないので、そこで信頼済みにしたフックは動かない。実装の Codex はユーザー設定をそのまま読む。
 
 ### agent:spec
 
 1. リポジトリを `--depth 100` で clone する。
-2. Claude `claude-opus-5-5` を `--restricted` で起動する。MCP は読み込まず、使えるツールは Read、Grep、Glob と、仕様のファイルへの Write だけで、Bash は渡さない。時間は 20 分まで、費用の上限は 5 USD である。
+2. Claude `claude-opus-5-5` を `--restricted` で起動する。MCP は読み込まず、使えるツールは Read、Grep、Glob、Skill と、仕様のファイルへの Write だけで、Bash は渡さない。時間は 20 分まで、費用の上限は 5 USD である。
 3. 書かれた仕様を、`## 仕様` の形（決定、根拠、変更対象、検証方法、リスクと未決事項、次の担当）で Issue にコメントする。人の判断が要る点は `## 判断待ち` の節に書かれ、仕様とは別のコメントで投稿される。このとき仕様の末尾には、判断が決まるまで `agent:impl` を付けないよう書き、次の担当は人にさせる。「検証方法」には、実装後に自動で実行するコマンドを ` ```verify ` の囲みに 1 行 1 コマンドで書かせる（後述の実装後の検証）。
 4. Claude が利用できないと確認でき、途中の出力もない場合に限り、Codex `gpt-6-luna` を読み取り専用で起動する。MCP は読み込まず、web 検索も無効で、時間は 20 分までである。Luna も利用できなければ、同じ条件で Terra で再試行する。Terra も使えなければ Issue に中断を報告して止まる。
 
@@ -87,7 +89,7 @@ PR 専用の worktree（`~/.worktrees/<repo>-pr-<番号>`）で、PR 本文と�
 
 作成者が利用者の PR だけを扱う。PR の head を `refs/pull/<番号>/head` から取得し、`origin/<基準ブランチ>` との差分を `.agent-diff.patch` に書いてレビューさせる。結果は `## レビュー` から始まり、最後に `判定: 問題なし` か `判定: 要修正` が付く。
 
-Claude は `opus` を `--restricted` で起動し、使えるツールを読み取りと `git log`、`git show`、`git grep`、`git diff`、`git ls-files`、`ls` に限る。時間は 8 分まで、費用の上限は 3 USD である。Codex の場合も読み取り専用で、時間は 8 分までである。
+Claude は `opus` を `--restricted` で起動し、使えるツールを読み取りと Skill、`git log`、`git show`、`git grep`、`git diff`、`git ls-files`、`ls` に限る。時間は 8 分まで、費用の上限は 3 USD である。Codex の場合も読み取り専用で、時間は 8 分までである。
 
 ## 担当の切り替え
 
