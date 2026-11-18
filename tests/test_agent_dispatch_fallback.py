@@ -13,7 +13,7 @@ if name=='gh':
 if name=='agent-notify': sys.exit(0)
 if name=='tea':
  if 'comment' in args:
-  with (state/'comments').open('a') as f: f.write(args[-1]+'\n')
+  with (state/'comments').open('a') as f: f.write(args[-1]+'\n\x1e\n')
   sys.exit(0)
  if 'edit' in args: sys.exit(0)
  url=next((a for a in args if a.startswith('/repos/') or a=='/user'),'')
@@ -32,6 +32,9 @@ if name=='claude':
  if scenario.startswith('spec') or scenario.startswith('review') or scenario=='impl_primary':
   if scenario=='spec_primary':
    pathlib.Path('.agent-spec-comment.md').write_text('## 仕様\n- 決定: テスト\n')
+   print('{"type":"result","is_error":false,"result":"done"}'); sys.exit(0)
+  if scenario=='spec_decision':
+   pathlib.Path('.agent-spec-comment.md').write_text('## 仕様\n- 決定: テスト\n- 次の担当: 人\n\n## 判断待ち\n- 操作: 選ぶ\n')
    print('{"type":"result","is_error":false,"result":"done"}'); sys.exit(0)
   if scenario=='spec_denied':
    print(json.dumps({'type':'result','is_error':True,'result':'approval rejected'})); sys.exit(1)
@@ -108,6 +111,11 @@ class DispatchTest(DispatchFixture):
   r=self.run_dispatch('spec_primary'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('着手: claude (spec)',self.comments()); self.assertIn('完了: claude (spec)',self.comments()); self.assertNotIn('codex',self.calls())
   args=self.claude_args()[0]; self.assertEqual(args[args.index('--model')+1],'claude-opus-5-5'); self.assertIn('--restricted',args); self.assertEqual(args[args.index('--tools')+1],'Read,Grep,Glob,Write')
   prompt=args[args.index('-p')+1]; self.assertIn('Bash は使えない',prompt); self.assertNotIn('Bash で実行できるのは',prompt)
+ def test_spec_posts_decision_as_separate_comment(self):
+  r=self.run_dispatch('spec_decision'); self.assertEqual(r.returncode,0,r.stderr)
+  posted=[x for x in self.comments().split('\n\x1e\n') if x.strip()]
+  spec=next(x for x in posted if x.startswith('## 仕様')); decision=next(x for x in posted if x.startswith('## 判断待ち'))
+  self.assertLess(posted.index(spec),posted.index(decision)); self.assertNotIn('判断待ち\n',spec.split('---')[0]); self.assertIn('付けないでください',spec); self.assertNotIn('実装に進めるときは',spec); self.assertIn('- 操作: 選ぶ',decision)
  def test_spec_falls_back_to_codex_luna(self):
   r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna']); self.assertIn('完了: codex (spec)',self.comments())
   profile=' '.join(self.codex_args()[0]); self.assertIn('/usr/bin/git',profile); self.assertIn('/usr/lib/git-core',profile); self.assertIn('shell_environment_policy.set.PATH',profile); self.assertIn('Bash で実行できるのは',profile)
