@@ -21,4 +21,26 @@ class CleanupTest(unittest.TestCase):
   self.assertTrue(self.target.exists())
  def test_origin_parser(self):
   self.assertEqual(m.origin_identity('git@github.com:o/r.git'),('github.com','o','r'));self.assertEqual(m.origin_identity('https://gitea.example/o/r.git'),('gitea.example','o','r'))
+ def env(self,text):
+  f=self.base/'env';f.write_text(text);host=patch.object(m,'GITEA_TOKEN_HOST','gitea.example.test');host.start();self.addCleanup(host.stop);return patch.object(m,'ENV_FILE',f)
+ def test_gitea_token_only_for_its_host(self):
+  with self.env('A=1\nexport GITEA_TOKEN=old\nGITEA_API_KEY="tok-1.x" # note\n'):
+   self.assertEqual(m.gitea_token(m.GITEA_TOKEN_HOST),'tok-1.x');self.assertIsNone(m.gitea_token('other.example.test'));self.assertIsNone(m.gitea_token('github.com'))
+ def test_gitea_token_absent_or_odd_value(self):
+  with self.env('GITEA_TOKEN=old\n'):self.assertIsNone(m.gitea_token(m.GITEA_TOKEN_HOST))
+  with self.env('GITEA_API_KEY=a b"c\n'):self.assertIsNone(m.gitea_token(m.GITEA_TOKEN_HOST))
+  with patch.object(m,'ENV_FILE',self.base/'missing'):self.assertIsNone(m.gitea_token(m.GITEA_TOKEN_HOST))
+ def gitea_call(self,env_text):
+  pr='{"merged_at":"t","state":"closed","head":{"sha":"abc"},"base":{"ref":"main","repo":{"name":"r","owner":{"login":"o"}}}}'
+  calls=[];fake=lambda a,**k:(calls.append((a,k)),subprocess.CompletedProcess(a,0,pr,''))[1]
+  with self.env(env_text),patch.object(m,'git',return_value='https://%s/o/r.git'%m.GITEA_TOKEN_HOST),patch.object(m.subprocess,'run',fake),patch.object(m,'run',lambda a,cwd=None:fake(a)):
+   m.merged_pr(self.target,'https://%s/o/r/pulls/1'%m.GITEA_TOKEN_HOST,'abc')
+  return calls[0]
+ def test_gitea_token_goes_via_stdin_not_argv(self):
+  a,k=self.gitea_call('GITEA_API_KEY=secrettok\n')
+  self.assertNotIn('secrettok',' '.join(a));self.assertNotIn('--netrc',a);self.assertIn('Authorization: token secrettok',k['input'])
+ def test_gitea_falls_back_to_netrc_without_token(self):
+  a,k=self.gitea_call('OTHER=1\n')
+ def test_no_token_host_configured_uses_netrc_only(self):
+  with self.env('GITEA_API_KEY=tok\n'),patch.object(m,'GITEA_TOKEN_HOST',''):self.assertIsNone(m.gitea_token('gitea.example.test'));self.assertIsNone(m.gitea_token(''))
 if __name__=='__main__':unittest.main()

@@ -12,6 +12,9 @@ from urllib.parse import urlparse
 
 ROOT = Path.home() / '.worktrees'
 BACKUPS = Path.home() / 'backups' / 'worktree-cleanup'
+ENV_FILE = Path.home() / '.env'
+# GITEA_API_KEY in ~/.env is valid only for the Gitea API host (AGENT_GITEA_GIT); ~/.netrc is for git and gets 401 on the API.
+GITEA_TOKEN_HOST = (urlparse(os.environ.get('AGENT_GITEA_GIT', '')).hostname or '').lower()
 
 
 def run(args, cwd=None):
@@ -34,6 +37,21 @@ def origin_identity(url):
     return match.groups()
 
 
+def gitea_token(host):
+    """Return GITEA_API_KEY from ~/.env for the one host it belongs to, else None."""
+    if not GITEA_TOKEN_HOST or host.lower() != GITEA_TOKEN_HOST:
+        return None
+    try:
+        lines = ENV_FILE.read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        found = re.fullmatch(r'(?:export\s+)?GITEA_API_KEY=(["\']?)([A-Za-z0-9._-]+)\1\s*(?:#.*)?', line.strip())
+        if found:
+            return found.group(2)
+    return None
+
+
 def merged_pr(path, pr_url, head):
     parsed = urlparse(pr_url)
     match = re.fullmatch(r'/([^/]+)/([^/]+)/pull(?:s)?/(\d+)/?', parsed.path)
@@ -47,7 +65,15 @@ def merged_pr(path, pr_url, head):
     if host.lower() == 'github.com':
         result = run(['gh', 'api', endpoint])
     else:
-        result = run(['curl', '--fail', '--silent', '--show-error', '--netrc', '--max-time', '20', f'https://{host}/api/v1/{endpoint}'])
+        url = f'https://{host}/api/v1/{endpoint}'
+        token = gitea_token(host)
+        if token:
+            # The token goes in through stdin so it never shows up in the process list.
+            result = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '20', '--config', '-'],
+                                    input=f'url = "{url}"\nheader = "Authorization: token {token}"\n',
+                                    text=True, capture_output=True, timeout=30)
+        else:
+            result = run(['curl', '--fail', '--silent', '--show-error', '--netrc', '--max-time', '20', url])
     if result.returncode:
         raise RuntimeError('PR status unavailable')
     pr = json.loads(result.stdout)
