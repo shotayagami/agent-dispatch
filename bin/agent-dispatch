@@ -1,7 +1,8 @@
 #!/bin/bash
 # Issue のラベルを見てエージェントに作業を渡す (定期起動用)。GitHub (gh) と Gitea (tea) の両方を見る。
 # 決まり: ~/.claude/rules/agent-collaboration.md (着手・受け渡し)、~/.claude/rules/agent-autonomy.md (判断の範囲)
-#   agent:spec … Codex (Luna) が仕様を作成し、利用できなければ Codex (Terra) で再試行する。Terra も利用できなければ報告して停止する。
+#   agent:spec … Claude Opus 5.5 が仕様を作成する (Bash なし、ファイルは作業ディレクトリ内だけ)。利用できなければ Codex (Luna)、
+#                次に Codex (Terra) で再試行する。Terra も利用できなければ報告して停止する。
 #   agent:impl … Codex (Luna) が worktree で実装する。既定では利用できなければ Claude Sonnet 5.5 を使う。agent-impl-ai codex-only 中は Terra で再試行する。
 #   (agent:impl の一時的な Codex 上位モデルへの切り替えは agent-impl-ai codex-only。review は別の切り替え)
 #                この script がコミット・push・PR 作成を行い、実装していない AI がレビューする。マージは人が行う。
@@ -21,6 +22,7 @@ IMPL_MODEL=gpt-6-luna
 IMPL_FALLBACK_MODEL=gpt-6.1-terra
 CODEX_BIN="${AGENT_CODEX_BIN:-$(command -v codex || find "$HOME/.vscode-server/extensions" -type f -path '*/bin/linux-x86_64/codex' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)}"
 [[ -n $CODEX_BIN ]] && CODEX_BIN="$(readlink -f "$CODEX_BIN")"
+CLAUDE_SPEC_MODEL=claude-opus-5-5
 CLAUDE_IMPL_MODEL=claude-sonnet-5-5
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch"; mkdir -p "$STATE"
 exec 9>"$STATE/lock"; flock -n 9 || { echo "前回の実行が続いています"; exit 0; }
@@ -73,7 +75,7 @@ count_use
 IMPL_CODEX_ONLY="$STATE/impl-codex-only" # impl のみ Codex 内で上位モデルへ切り替える (agent-impl-ai codex-only)
 REVIEW_CODEX="$STATE/review-by-codex"   # このファイルがある間は、レビューを最初から Codex が行う。Claude へは切り替えない (agent-spec-ai review-codex)
 if [[ -e $REVIEW_CODEX ]]; then REVIEW_WHO=codex; else REVIEW_WHO=claude; fi
-case $LABEL in agent:spec) WHO='codex (spec)';; agent:review) WHO="$REVIEW_WHO (review)";; *) WHO="codex (impl)";; esac
+case $LABEL in agent:spec) WHO='claude (spec)';; agent:review) WHO="$REVIEW_WHO (review)";; *) WHO="codex (impl)";; esac
 echo "処理: $LABEL $FORGE $REPO#$NUM $TITLE"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 LOG="$STATE/$(date +%Y%m%dT%H%M%S)-${REPO//\//_}-$NUM.log"
@@ -233,11 +235,12 @@ if [[ $LABEL == agent:spec ]]; then
   git clone -q --depth 100 "$GITURL" "$WORK/repo" 2>>"$LOG" || fail "リポジトリを clone できませんでした ($GITURL)。"
   mv "$WORK/issue.md" "$WORK/repo/.agent-issue.md"
   cd "$WORK/repo" || exit 1
+  SPEC_BASH='- Bash で実行できるのは git status / git log / git show / git grep / git ls-files / ls / cat だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は git show または cat、検索は git grep で読む。'
   PROMPT="作業ディレクトリは $REPO ($FORGE) を clone したものです。.agent-issue.md に Issue $REPO#$NUM の本文とコメントがあります。
 この Issue について仕様を作り、結果を .agent-spec-comment.md に Write で書いてください。Issue への投稿は呼び出し側が行います。
 
 - ファイルは読むだけにし、.agent-spec-comment.md 以外は作成も編集もしない。
-- Bash で実行できるのは git status / git log / git show / git grep / git ls-files / ls / cat だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は git show または cat、検索は git grep で読む。
+$SPEC_BASH
 - コメントは日本語で、次の形にする。
   ## 仕様
   - 決定:
@@ -256,21 +259,36 @@ if [[ $LABEL == agent:spec ]]; then
   - 待つ間に進める作業:
 - リポジトリの中で確かめられないこと (本番の状態など) は推測で埋めず、未決事項に書く。
 - 許可されていない操作が拒否されたら、言い換えて再試行せず、そのことを未決事項に書く。"
-  SPEC_AI=codex
-  CODEX_PROMPT="${PROMPT/結果を .agent-spec-comment.md に Write で書いてください。/結果の本文だけを日本語で最終回答として出力してください。}"
-  CODEX_PROMPT+=$'\nファイルを作成・変更しないでください。\n'
-  # Claude 用 agent 定義の Opus 指定は Codex のモデル選択と矛盾するため、本文の役割だけを渡す。
-  CODEX_PROMPT+="$(ROLE spec | sed '/^# 仕様策定は Opus/d')"
-  if codex_readonly 20m "$PWD/.agent-spec-comment.md" "$CODEX_PROMPT" "$SPEC_MODEL" && [[ -s .agent-spec-comment.md ]]; then
+  # Claude には Bash を渡さない。--restricted がファイル操作を作業ディレクトリに閉じ込めるが、Bash には効かないため。
+  CLAUDE_PROMPT="${PROMPT/"$SPEC_BASH"/- Bash は使えない。ファイルの中身は Read、検索は Grep と Glob で読む。git の履歴は見られない。}"
+  # spec.md の「Edit / Write は持っていない」は、仕様を Write で書かせるこの経路と矛盾するので除く。
+  SPEC_AI=claude
+  if claude_result 20m -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE spec | grep -v 'Edit / Write は持っていない')" --model "$CLAUDE_SPEC_MODEL" \
+    --restricted --strict-mcp-config --tools "Read,Grep,Glob,Write" --allowedTools "Read Grep Glob Write" \
+    --permission-mode dontAsk --max-budget-usd 5 && [[ -s .agent-spec-comment.md ]]; then
     :
   else
     if [[ ! -s .agent-spec-comment.md ]]; then rm -f .agent-spec-comment.md; fi
     if [[ -e .agent-spec-comment.md ]] || ! unavailable "$AI_RC" "$WORK/ai-errors" || ! clean_readonly_source; then
-      fail "Codex Luna が仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
+      fail "Claude Opus が仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
     fi
-    echo "Codex Luna unavailable; retrying specification with Codex Terra" >>"$LOG"
-    codex_readonly 20m "$PWD/.agent-spec-comment.md" "$CODEX_PROMPT" "$SPEC_FALLBACK_MODEL" && [[ -s .agent-spec-comment.md ]] \
-      || fail "Codex Luna と Codex Terra で仕様を書けませんでした (rc=$AI_RC)。Issue に中断を報告しました。ログは cg-dev の $LOG です。"
+    echo "Claude unavailable; switching specification to Codex Luna" >>"$LOG"
+    SPEC_AI=codex; WHO='codex (spec)'
+    CODEX_PROMPT="${PROMPT/結果を .agent-spec-comment.md に Write で書いてください。/結果の本文だけを日本語で最終回答として出力してください。}"
+    CODEX_PROMPT+=$'\nファイルを作成・変更しないでください。\n'
+    # Claude 用 agent 定義の Opus 指定は Codex のモデル選択と矛盾するため、本文の役割だけを渡す。
+    CODEX_PROMPT+="$(ROLE spec | sed '/^# 仕様策定は Opus/d')"
+    if codex_readonly 20m "$PWD/.agent-spec-comment.md" "$CODEX_PROMPT" "$SPEC_MODEL" && [[ -s .agent-spec-comment.md ]]; then
+      :
+    else
+      if [[ ! -s .agent-spec-comment.md ]]; then rm -f .agent-spec-comment.md; fi
+      if [[ -e .agent-spec-comment.md ]] || ! unavailable "$AI_RC" "$WORK/ai-errors" || ! clean_readonly_source; then
+        fail "Claude が利用できず、Codex Luna も仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
+      fi
+      echo "Codex Luna unavailable; retrying specification with Codex Terra" >>"$LOG"
+      codex_readonly 20m "$PWD/.agent-spec-comment.md" "$CODEX_PROMPT" "$SPEC_FALLBACK_MODEL" && [[ -s .agent-spec-comment.md ]] \
+        || fail "Claude、Codex Luna、Codex Terra のいずれでも仕様を書けませんでした (rc=$AI_RC)。Issue に中断を報告しました。ログは cg-dev の $LOG です。"
+    fi
   fi
   printf '\n\n---\n完了: %s (spec)。実装に進めるときは `agent:impl` ラベルを付けてください。\n' "$SPEC_AI" >> .agent-spec-comment.md
   comment .agent-spec-comment.md || fail "仕様を Issue に投稿できませんでした。"

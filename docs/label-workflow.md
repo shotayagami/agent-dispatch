@@ -29,7 +29,7 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 
 | ラベル | 付ける先 | 担当 | 結果 |
 |---|---|---|---|
-| `agent:spec` | Issue | Codex の `gpt-6-luna`。使えなければ `gpt-6.1-terra` | 仕様を Issue にコメントする |
+| `agent:spec` | Issue | Claude の `claude-opus-5-5`。使えなければ Codex の `gpt-6-luna`、次に `gpt-6.1-terra` | 仕様を Issue にコメントする |
 | `agent:impl` | Issue（仕様のコメントがあるもの） | Codex の `gpt-6-luna`。切り替えは後述 | worktree で実装し、PR を作ってレビューまで進める |
 | `agent:pr-fix` | 利用者が作った PR | `agent:impl` と同じ | 既存 PR のブランチに修正を push し、PR に報告する |
 | `agent:review` | 利用者が作った PR | 既定は Claude。使えなければ Codex | 差分のレビューを PR にコメントする |
@@ -56,9 +56,9 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 ### agent:spec
 
 1. リポジトリを `--depth 100` で clone する。
-2. Codex を読み取り専用で起動する。MCP は読み込まず、web 検索も無効で、時間は 20 分までである。
-3. Codex が書いた仕様を、`## 仕様` の形（決定、根拠、変更対象、検証方法、リスクと未決事項、次の担当）で Issue にコメントする。人の判断が要る点は `## 判断待ち` の節に書かれる。「検証方法」には、実装後に自動で実行するコマンドを ` ```verify ` の囲みに 1 行 1 コマンドで書かせる（後述の実装後の検証）。
-4. Luna が利用できないと確認でき、途中の出力もない場合に限り、Terra で再試行する。Terra も使えなければ Issue に中断を報告して止まる。
+2. Claude `claude-opus-5-5` を `--restricted` で起動する。MCP は読み込まず、使えるツールは Read、Grep、Glob と、仕様のファイルへの Write だけで、Bash は渡さない。時間は 20 分まで、費用の上限は 5 USD である。
+3. 書かれた仕様を、`## 仕様` の形（決定、根拠、変更対象、検証方法、リスクと未決事項、次の担当）で Issue にコメントする。人の判断が要る点は `## 判断待ち` の節に書かれる。「検証方法」には、実装後に自動で実行するコマンドを ` ```verify ` の囲みに 1 行 1 コマンドで書かせる（後述の実装後の検証）。
+4. Claude が利用できないと確認でき、途中の出力もない場合に限り、Codex `gpt-6-luna` を読み取り専用で起動する。MCP は読み込まず、web 検索も無効で、時間は 20 分までである。Luna も利用できなければ、同じ条件で Terra で再試行する。Terra も使えなければ Issue に中断を報告して止まる。
 
 ### agent:impl
 
@@ -93,7 +93,7 @@ Claude は `opus` を `--restricted` で起動し、使えるツールを読み�
 
 | 作業 | 既定 | 利用不可のとき |
 |---|---|---|
-| spec | Codex `gpt-6-luna` | Codex `gpt-6.1-terra`。それも使えなければ中断（Claude には切り替えない） |
+| spec | Claude `claude-opus-5-5` | Codex `gpt-6-luna`、次に `gpt-6.1-terra`。どれも使えなければ中断 |
 | impl | Codex `gpt-6-luna` | 既定は Claude `claude-sonnet-5-5`（ファイルの読み書きだけで実装）。`impl-codex-only` が有効なら Codex `gpt-6.1-terra`（Claude には切り替えない） |
 | review（impl と pr-fix の後） | 実装していない AI。Codex が実装したときは Claude `opus` | 切り替えず、「独立レビューは未実施」と記録する |
 | review（`agent:review`） | Claude `opus` | Codex |
