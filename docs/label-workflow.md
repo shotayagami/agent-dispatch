@@ -78,7 +78,7 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 - 作成者が利用者である。
 - open である。
 - fork からの PR ではない。
-- 基準ブランチが既定ブランチである。
+- 基準ブランチが、既定ブランチか、`base-branch` にそのリポジトリの行として書いたブランチである。
 - リモートのブランチ先頭が PR の head と一致している。
 
 PR 専用の worktree（`~/.worktrees/<repo>-pr-<番号>`）で、PR 本文と利用者のコメントにあるレビュー指摘を修正する。push の直前に PR の状態を測り直し、head が変わっていれば push しない。push は fast-forward のみで、`--force-with-lease` に PR の head を指定する。
