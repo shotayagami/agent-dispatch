@@ -397,7 +397,10 @@ if [[ ! -d "$CACHE" ]]; then
   git -C "$CACHE" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
 fi
 git -C "$CACHE" fetch -q --prune origin 2>>"$LOG" || fail "git fetch に失敗しました。"
-BASE="$(git -C "$CACHE" ls-remote --symref origin HEAD | awk '/^ref:/{sub("refs/heads/","",$2); print $2}')"
+# 作業の起点と PR の基準ブランチ。既定ブランチ以外を使うリポジトリ (開発を dev で行うものなど) は state の base-branch に「<forge>:<repo> <branch>」で書く。
+BASE="$(awk -v r="$FORGE:$REPO" '$1 == r {print $2; exit}' "$STATE/base-branch" 2>/dev/null)"
+if [[ -n "$BASE" ]]; then git -C "$CACHE" show-ref --verify --quiet "refs/remotes/origin/$BASE" || fail "base-branch に書いたブランチ $BASE が origin にありません。"
+else BASE="$(git -C "$CACHE" ls-remote --symref origin HEAD | awk '/^ref:/{sub("refs/heads/","",$2); print $2}')"; fi
 [[ -n "$BASE" ]] || fail "既定のブランチを判定できませんでした。"
 if (( PRFIX )); then
   if [[ $FORGE == github ]]; then
@@ -547,6 +550,7 @@ case $vrc in
   0) VERIFY_LINE="検証: 成功 (再実装 $VERIFY_TRY 回)";;
   1) VERIFY_LINE="検証: 失敗 (再実装 $VERIFY_TRY 回でも解消せず。人の確認が必要)";;
   3) VERIFY_LINE="検証: 未実施 (仕様に verify ブロックがない)";;
+  4) VERIFY_LINE="検証: 未実施 (sandbox に検証コマンドが無い。再実装はしていない)";;
   *) VERIFY_LINE="検証: 検証ヘルパーが異常終了 (rc=$vrc)。ログ $LOG を確認";;
 esac
 { printf '\n## 検証 (dispatcher が sandbox で実行)\n- %s\n\n' "$VERIFY_LINE"; cat "$WORK/verify.md"; } >> .agent-impl-report.md
