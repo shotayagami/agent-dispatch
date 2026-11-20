@@ -1,13 +1,14 @@
 #!/bin/bash
 # Issue のラベルを見てエージェントに作業を渡す (定期起動用)。GitHub (gh) と Gitea (tea) の両方を見る。
 # 決まり: ~/.claude/rules/agent-collaboration.md (着手・受け渡し)、~/.claude/rules/agent-autonomy.md (判断の範囲)
-#   agent:spec … Claude Opus 5.5 が仕様を作成する (Bash なし、ファイルは作業ディレクトリ内だけ)。利用できなければ Codex (Luna)、
+#   agent:spec … Claude (Opus 5.5、次に Fable) が仕様を作成する (Bash なし、ファイルは作業ディレクトリ内だけ)。利用できなければ Codex (Luna)、
 #                次に Codex (Terra) で再試行する。Terra も利用できなければ報告して停止する。
-#   agent:impl … Codex (Luna) が worktree で実装する。既定では利用できなければ Claude Sonnet 5.5 を使う。agent-impl-ai codex-only 中は Terra で再試行する。
-#   (agent:impl の一時的な Codex 上位モデルへの切り替えは agent-impl-ai codex-only。review は別の切り替え)
+#   agent:impl … Codex (6.2-Sol、6.2-Astra、6-Luna の順) が worktree で実装する。すべて利用できなければ Claude (Sonnet 5.5、Opus 5.5、Fable の順) を使う。
+#                agent-impl-ai codex-only 中は Claude へ切り替えない。
 #                この script がコミット・push・PR 作成を行い、実装していない AI がレビューする。マージは人が行う。
-#   agent:review … 利用者が作った PR を Claude がレビューする。利用できなければ Codex (読み取りのみ) を使う。
+#   agent:review … 利用者が作った PR を Claude (Opus 5.5、次に Fable) がレビューする。利用できなければ Codex (読み取りのみ) を使う。
 #                  state の review-by-codex ファイルがある間は、agent:impl の後のレビューも含め、最初から Codex が行う (agent-spec-ai review-codex)。
+#                  レビューも先の AI が利用できなければもう片方に切り替え、実装と同じ AI になったらその旨を注記する。
 # エージェントには forge の道具も資格情報も渡さない。投稿・push はこの script が行う。
 # 1 回の起動で 1 件だけ処理する。拾った Issue からはラベルを外すので、二重には拾わない。
 # 使い方: agent-dispatch [--dry-run]   (--dry-run は候補を表示するだけ)
@@ -18,12 +19,13 @@ GITEA_GIT="${AGENT_GITEA_GIT:?AGENT_GITEA_GIT に Gitea の git / API の接続�
 LABELS=(agent:spec agent:impl agent:review agent:pr-fix)
 SPEC_MODEL=gpt-6-luna
 SPEC_FALLBACK_MODEL=gpt-6.1-terra
-IMPL_MODEL=gpt-6-luna
-IMPL_FALLBACK_MODEL=gpt-6.1-terra
+IMPL_MODEL=gpt-6.2-sol
+IMPL_FALLBACK_MODELS=(gpt-6.2-astra gpt-6-luna)  # agent-impl-ai codex-only 中に順に試す
 CODEX_BIN="${AGENT_CODEX_BIN:-$(command -v codex || find "$HOME/.vscode-server/extensions" -type f -path '*/bin/linux-x86_64/codex' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)}"
 [[ -n $CODEX_BIN ]] && CODEX_BIN="$(readlink -f "$CODEX_BIN")"
-CLAUDE_SPEC_MODEL=claude-opus-5-5
-CLAUDE_IMPL_MODEL=claude-sonnet-5-5
+# Claude は利用上限などで使えなければ、この順に次のモデルへ進む。fable は CLI の別名 (CLI 2.1.302 は claude-fable-5-2 を認識しない)
+CLAUDE_MODELS=(claude-opus-5-5 fable)                     # spec と review
+CLAUDE_IMPL_MODELS=(claude-sonnet-5-5 "${CLAUDE_MODELS[@]}") # impl だけ Sonnet から
 STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-dispatch"; mkdir -p "$STATE"
 exec 9>"$STATE/lock"; flock -n 9 || { echo "前回の実行が続いています"; exit 0; }
 DRY=0; [[ "${1:-}" == --dry-run ]] && DRY=1
@@ -166,6 +168,21 @@ claude_result() {  # claude_result <timeout> <arguments...>
   return 1
 }
 
+# Claude のモデルを順に試す。利用不可を確認でき、<確認の関数> が途中出力のないことを確かめたときだけ次へ進む。
+claude_models() {  # claude_models <timeout> <確認の関数> <モデル...> -- <claude の引数...>
+  local duration=$1 check=$2 m; local -a models=(); shift 2
+  while [[ $1 != -- ]]; do models+=("$1"); shift; done; shift
+  for m in "${models[@]}"; do
+    [[ $m == "${models[0]}" ]] || echo "Claude unavailable; retrying with Claude $m" >>"$LOG"
+    claude_result "$duration" "$@" --model "$m" && return 0
+    unavailable "$AI_RC" "$WORK/ai-errors" && "$check" || return 1
+  done
+  return 1
+}
+spec_clean() { [[ -s .agent-spec-comment.md ]] || rm -f .agent-spec-comment.md; [[ ! -e .agent-spec-comment.md ]] && clean_readonly_source; }
+# レビューの作業ツリーには実装の報告などがあるので、レビュー開始時の状態 (review-status0) から変わっていないことを見る。
+review_clean() { [[ ! -e .agent-review.md ]] && git status --porcelain=v1 --ignored=matching --untracked-files=normal -z | cmp -s - "$WORK/review-status0"; }
+
 codex_result() {  # codex_result <timeout> <arguments...>
   local duration=$1; shift
   timeout "$duration" "$CODEX_BIN" exec --json "$@" >"$WORK/codex.jsonl" 2>"$WORK/codex.stderr"
@@ -247,19 +264,22 @@ review() {  # review <PR 番号> <PR の基準ブランチ> <作業ツリーに�
   local reviewer='' codex_prompt
   codex_prompt="${RPROMPT/結果を .agent-review.md に Write で日本語で書いてください。/結果の本文だけを日本語で最終回答として出力してください。}"
   codex_prompt+=$'\nファイルを作成・変更せず、提示済みの .agent-diff.patch を差分の基準として読んでください。'
-  if [[ ${IMPLEMENTER:-} == claude || -e $REVIEW_CODEX ]]; then
-    if codex_readonly 8m "$PWD/.agent-review.md" "$codex_prompt" && [[ -s .agent-review.md ]]; then reviewer=codex; fi
-  else
-    if claude_result 8m -p "$RPROMPT" --model opus --restricted --strict-mcp-config \
-      --tools "Bash,Read,Grep,Glob,Write,Skill" \
-      --allowedTools "Read Grep Glob Write Skill Bash(git log:*) Bash(git show:*) Bash(git grep:*) Bash(git diff:*) Bash(git ls-files:*) Bash(ls:*)" \
-      --permission-mode dontAsk --max-budget-usd 3 && [[ -s .agent-review.md ]]; then
-      reviewer=claude
-    elif [[ -z ${IMPLEMENTER:-} && ! -e .agent-review.md ]] && unavailable "$AI_RC" "$WORK/ai-errors" && clean_readonly_source; then
-      echo "Claude unavailable; switching review to Codex" >>"$LOG"
-      if codex_readonly 8m "$PWD/.agent-review.md" "$codex_prompt" && [[ -s .agent-review.md ]]; then reviewer=codex; fi
+  # 先の AI が利用上限などで使えなければ、もう片方に切り替える。実装と同じ AI になったときは下で注記する。
+  git status --porcelain=v1 --ignored=matching --untracked-files=normal -z >"$WORK/review-status0" || { REVIEW="作業ツリーの状態を読めませんでした (ログ $LOG)"; return 1; }
+  local ai order=(claude codex)
+  [[ ${IMPLEMENTER:-} == claude || -e $REVIEW_CODEX ]] && order=(codex claude)
+  for ai in "${order[@]}"; do
+    if [[ $ai == codex ]]; then
+      codex_readonly 8m "$PWD/.agent-review.md" "$codex_prompt" && [[ -s .agent-review.md ]] && { reviewer=codex; break; }
+    else
+      claude_models 8m review_clean "${CLAUDE_MODELS[@]}" -- -p "$RPROMPT" --restricted --strict-mcp-config \
+        --tools "Bash,Read,Grep,Glob,Write,Skill" \
+        --allowedTools "Read Grep Glob Write Skill Bash(git log:*) Bash(git show:*) Bash(git grep:*) Bash(git diff:*) Bash(git ls-files:*) Bash(ls:*)" \
+        --permission-mode dontAsk --max-budget-usd 3 && [[ -s .agent-review.md ]] && { reviewer=claude; break; }
     fi
-  fi
+    review_clean && unavailable "$AI_RC" "$WORK/ai-errors" || break
+    echo "$ai unavailable; switching review" >>"$LOG"
+  done
   if [[ -z $reviewer ]]; then
     REVIEW="独立レビューは未実施 (ログ $LOG)"; return 1
   fi
@@ -309,14 +329,14 @@ $SPEC_YOMI$SPEC_KEEP
   CLAUDE_PROMPT="${PROMPT/"$SPEC_BASH"/- Bash は使えない。ファイルの中身は Read、検索は Grep と Glob で読む。git の履歴は見られない。}"
   # spec.md の「Edit / Write は持っていない」は、仕様を Write で書かせるこの経路と矛盾するので除く。
   SPEC_AI=claude
-  if claude_result 20m -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE spec | grep -v 'Edit / Write は持っていない')" --model "$CLAUDE_SPEC_MODEL" \
+  if claude_models 20m spec_clean "${CLAUDE_MODELS[@]}" -- -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE spec | grep -v 'Edit / Write は持っていない')" \
     --restricted --strict-mcp-config --tools "Read,Grep,Glob,Write,Skill" --allowedTools "Read Grep Glob Write Skill" \
     --permission-mode dontAsk --max-budget-usd 5 && [[ -s .agent-spec-comment.md ]]; then
     :
   else
     if [[ ! -s .agent-spec-comment.md ]]; then rm -f .agent-spec-comment.md; fi
     if [[ -e .agent-spec-comment.md ]] || ! unavailable "$AI_RC" "$WORK/ai-errors" || ! clean_readonly_source; then
-      fail "Claude Opus が仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
+      fail "Claude が仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
     fi
     echo "Claude unavailable; switching specification to Codex Luna" >>"$LOG"
     SPEC_AI=codex; WHO='codex (spec)'
@@ -497,33 +517,27 @@ $PROMPT"
 $PROMPT"
   fi
 fi
-IMPLEMENTER=codex; IMPL_USED=$IMPL_MODEL
-if codex_result 20m -m "$IMPL_MODEL" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT"; then
-  rc=0
-else
+# Codex のモデルを順に試し、すべて利用不可なら Claude に切り替える (agent-impl-ai codex-only 中は切り替えない)。
+# 次へ進むのは、利用不可を確認でき、途中の変更や生成物がないときだけ。
+IMPLEMENTER=codex; rc=1
+for IMPL_USED in "$IMPL_MODEL" "${IMPL_FALLBACK_MODELS[@]}"; do
+  [[ $IMPL_USED == "$IMPL_MODEL" ]] || echo "Codex unavailable; retrying with Codex $IMPL_USED" >>"$LOG"
+  if codex_result 20m -m "$IMPL_USED" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT"; then
+    rc=0; break
+  fi
   rc=$AI_RC
   [[ $rc == 0 ]] && rc=1
-  if unavailable "$AI_RC" "$WORK/ai-errors" && clean_for_fallback; then
-    if [[ -e $IMPL_CODEX_ONLY ]]; then
-      echo "Codex Luna unavailable; retrying with Codex Terra; Claude fallback disabled" >>"$LOG"
-      IMPL_USED=$IMPL_FALLBACK_MODEL
-      if codex_result 20m -m "$IMPL_FALLBACK_MODEL" -s workspace-write -c 'approval_policy="never"' -C "$WT" -o "$WORK/codex-last.txt" "$PROMPT"; then
-        rc=0
-      else
-        rc=$AI_RC
-        [[ $rc == 0 ]] && rc=1
-      fi
-    else
-      echo "Codex unavailable; switching implementation to Claude" >>"$LOG"
-      IMPLEMENTER=claude; WHO='claude (impl)'
-      CLAUDE_PROMPT="$PROMPT
+  unavailable "$AI_RC" "$WORK/ai-errors" && clean_for_fallback || break
+done
+if (( rc != 0 )) && [[ ! -e $IMPL_CODEX_ONLY ]] && unavailable "$AI_RC" "$WORK/ai-errors" && clean_for_fallback; then
+  echo "Codex unavailable; switching implementation to Claude" >>"$LOG"
+  IMPLEMENTER=claude; WHO='claude (impl)'
+  CLAUDE_PROMPT="$PROMPT
 
 この実行では Bash とネットワークを使えません。ファイルの読み書きだけで作業し、実行できなかった検証は報告してください。"
-      if claude_result 20m -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE impl)" --model "$CLAUDE_IMPL_MODEL" --restricted --strict-mcp-config \
-        --tools "Read,Grep,Glob,Edit,Write,Skill" --allowedTools "Read Grep Glob Edit Write Skill" \
-        --permission-mode dontAsk --max-budget-usd 3; then rc=0; else rc=$AI_RC; [[ $rc == 0 ]] && rc=1; fi
-    fi
-  fi
+  if claude_models 20m clean_for_fallback "${CLAUDE_IMPL_MODELS[@]}" -- -p "$CLAUDE_PROMPT" --append-system-prompt "$(ROLE impl)" --restricted --strict-mcp-config \
+    --tools "Read,Grep,Glob,Edit,Write,Skill" --allowedTools "Read Grep Glob Edit Write Skill" \
+    --permission-mode dontAsk --max-budget-usd 3; then rc=0; else rc=$AI_RC; [[ $rc == 0 ]] && rc=1; fi
 fi
 
 (( rc == 0 )) || fail "$IMPLEMENTER が実装を完了できませんでした (rc=$rc)。途中の作業を保持しました。worktree $WT とログ $LOG を確かめてください。"

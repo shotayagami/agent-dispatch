@@ -29,6 +29,16 @@ if name=='tea':
  sys.exit(2)
 if name=='claude':
  with (state/'claude_args.jsonl').open('a') as f: f.write(json.dumps(args)+'\n')
+ model=args[args.index('--model')+1] if '--model' in args else ''
+ review=any('.agent-diff.patch' in a for a in args)
+ if scenario=='spec_fable' and model=='fable':
+  pathlib.Path('.agent-spec-comment.md').write_text('## 仕様\n- 決定: テスト\n')
+  print('{"type":"result","is_error":false,"result":"done"}'); sys.exit(0)
+ if scenario=='impl_claude_chain' and model!='fable':
+  print(json.dumps({'type':'result','is_error':True,'result':"You've hit your limit"})); sys.exit(1)
+ if review and scenario in ('impl_fallback','impl_claude_chain'):
+  pathlib.Path('.agent-review.md').write_text('## レビュー\n判定: 問題なし\n')
+  print('{"type":"result","is_error":false,"result":"done"}'); sys.exit(0)
  if scenario.startswith('spec') or scenario.startswith('review') or scenario=='impl_primary':
   if scenario=='spec_primary':
    pathlib.Path('.agent-spec-comment.md').write_text('## 仕様\n- 決定: テスト\n')
@@ -65,13 +75,15 @@ if name=='codex':
   pathlib.Path('partial.txt').write_text('changed\n'); print(json.dumps({'type':'turn.failed','error':{'message':'usage_limit_reached'}})); sys.exit(1)
  if readonly and scenario=='spec_both_fail':
   print(json.dumps({'type':'turn.failed','error':{'message':'usage_limit_reached'}})); sys.exit(1)
- if not readonly and scenario in ('impl_fallback','impl_dirty','impl_ignored','impl_denied','impl_timeout','impl_unknown'):
+ if not readonly and scenario in ('impl_fallback','impl_claude_chain','impl_dirty','impl_ignored','impl_denied','impl_timeout','impl_unknown'):
   if scenario=='impl_dirty': pathlib.Path('partial.txt').write_text('keep me\n')
   if scenario=='impl_ignored':
    pathlib.Path('scratch').mkdir(exist_ok=True); pathlib.Path('scratch/output').write_text('keep me\n')
   message={'impl_denied':'approval rejected','impl_unknown':'unexpected failure'}.get(scenario,'usage_limit_reached')
   print(json.dumps({'type':'turn.failed','error':{'message':message}})); sys.exit(124 if scenario=='impl_timeout' else 1)
- if readonly and scenario=='impl_fallback':
+ if not readonly and scenario in ('impl_codex_chain','impl_codex_chain_fail') and (scenario=='impl_codex_chain_fail' or args[args.index('-m')+1]!='gpt-6-luna'):
+  print(json.dumps({'type':'turn.failed','error':{'message':'usage_limit_reached'}})); sys.exit(1)
+ if readonly and scenario in ('impl_fallback','impl_claude_chain'):
   print(json.dumps({'type':'turn.failed','error':{'message':'usage_limit_reached'}})); sys.exit(1)
  if '-o' in args:
   out=pathlib.Path(args[args.index('-o')+1])
@@ -137,7 +149,7 @@ class DispatchTest(DispatchFixture):
   (self.state/'agent-dispatch').mkdir(exist_ok=True); (self.state/'agent-dispatch/base-branch').write_text('gitea:gitea/proj no-such-branch\n')
   r=self.run_dispatch('impl_primary'); self.assertNotEqual(r.returncode,0); self.assertIn('base-branch に書いたブランチ no-such-branch が origin にありません',self.comments())
  def test_spec_falls_back_to_codex_luna(self):
-  r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna']); self.assertIn('完了: codex (spec)',self.comments())
+  r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual([a[a.index('--model')+1] for a in self.claude_args()],['claude-opus-5-5','fable']); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna']); self.assertIn('完了: codex (spec)',self.comments())
   profile=' '.join(self.codex_args()[0]); self.assertIn('/usr/bin/git',profile); self.assertIn('/usr/lib/git-core',profile); self.assertIn('shell_environment_policy.set.PATH',profile); self.assertIn('Bash で実行できるのは',profile)
  def test_readonly_codex_can_read_skills_and_shared_instructions(self):
   for d in ('.codex/skills/ponytail','.agents/skills/k8s','.claude/rules','.ssh'): (self.home/d).mkdir(parents=True)
@@ -151,7 +163,7 @@ class DispatchTest(DispatchFixture):
   prompt=self.codex_args()[0][-1]
   self.assertIn(str(self.home/'.codex/skills/yomiyasu/skills/yomiyasu/SKILL.md'),prompt); self.assertIn('run --stdin --no-record',prompt); self.assertIn('```verify の囲みの中身',prompt); self.assertNotIn('Skill ツール',prompt)
  def test_spec_falls_back_to_codex_terra(self):
-  r=self.run_dispatch('spec_luna_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna','gpt-6.1-terra']); self.assertIn('完了: codex (spec)',self.comments())
+  r=self.run_dispatch('spec_luna_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual([a[a.index('--model')+1] for a in self.claude_args()],['claude-opus-5-5','fable']); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna','gpt-6.1-terra']); self.assertIn('完了: codex (spec)',self.comments())
  def test_spec_denial_does_not_trigger_fallback(self):
   r=self.run_dispatch('spec_denied'); self.assertNotEqual(r.returncode,0); self.assertNotIn('codex',self.calls()); self.assertIn('中断: claude (spec)',self.comments())
  def test_spec_partial_output_does_not_trigger_fallback(self):
@@ -170,10 +182,26 @@ class DispatchTest(DispatchFixture):
   r=self.run_dispatch('review_partial'); self.assertNotEqual(r.returncode,0); self.assertNotIn('codex readonly',self.calls())
  def test_successful_review_does_not_fallback(self):
   r=self.run_dispatch('review_success'); self.assertEqual(r.returncode,0,r.stderr); self.assertNotIn('codex readonly',self.calls()); self.assertIn('レビュー: claude',self.comments())
- def test_impl_codex_review_not_self_reviewed(self):
-  r=self.run_dispatch('impl_primary'); self.assertEqual(r.returncode,0,r.stderr); self.assertNotIn('codex readonly',self.calls()); self.assertIn('独立レビューは未実施',self.comments()); self.assertEqual(self.codex_args()[0][self.codex_args()[0].index('-m')+1],'gpt-6-luna')
- def test_impl_falls_back_and_does_not_self_review(self):
-  r=self.run_dispatch('impl_fallback'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.calls().count('claude primary'),1); self.assertEqual(self.claude_args()[0][self.claude_args()[0].index('--model')+1],'claude-sonnet-5-5'); self.assertIn('codex readonly',self.calls()); self.assertIn('完了: claude (impl)',self.comments()); self.assertIn('独立レビューは未実施',self.comments())
+ def test_impl_codex_review_falls_back_to_codex_with_note(self):
+  r=self.run_dispatch('impl_primary'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual([a[a.index('--model')+1] for a in self.claude_args()],['claude-opus-5-5','fable']); self.assertIn('codex readonly',self.calls()); self.assertIn('レビュー: codex',self.comments()); self.assertIn('注意: 実装と同じ AI (codex)',self.comments()); self.assertEqual(self.codex_args()[0][self.codex_args()[0].index('-m')+1],'gpt-6.2-sol')
+ def test_impl_falls_back_to_claude_after_all_codex_models(self):
+  r=self.run_dispatch('impl_fallback'); self.assertEqual(r.returncode,0,r.stderr)
+  self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a and '--ignore-user-config' not in a],['gpt-6.2-sol','gpt-6.2-astra','gpt-6-luna'])
+  self.assertEqual([a[a.index('--model')+1] for a in self.claude_args()],['claude-sonnet-5-5','claude-opus-5-5']); self.assertIn('codex readonly',self.calls()); self.assertIn('完了: claude (impl)',self.comments())
+  self.assertIn('レビュー: claude',self.comments()); self.assertIn('注意: 実装と同じ AI (claude)',self.comments())
+ def test_impl_claude_chain_sonnet_opus_fable(self):
+  r=self.run_dispatch('impl_claude_chain'); self.assertEqual(r.returncode,0,r.stderr)
+  self.assertEqual([a[a.index('--model')+1] for a in self.claude_args()][:3],['claude-sonnet-5-5','claude-opus-5-5','fable']); self.assertIn('完了: claude (impl)',self.comments())
+ def test_spec_falls_back_to_claude_fable(self):
+  r=self.run_dispatch('spec_fable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual([a[a.index('--model')+1] for a in self.claude_args()],['claude-opus-5-5','fable']); self.assertNotIn('codex',self.calls()); self.assertIn('完了: claude (spec)',self.comments())
+ def test_impl_codex_only_tries_three_models_in_order(self):
+  (self.state/'agent-dispatch').mkdir(parents=True,exist_ok=True); (self.state/'agent-dispatch'/'impl-codex-only').touch()
+  r=self.run_dispatch('impl_codex_chain'); self.assertEqual(r.returncode,0,r.stderr); self.assertNotIn('claude-sonnet-5-5',json.dumps(self.claude_args())); self.assertIn('完了: codex',self.comments())
+  self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a and '--ignore-user-config' not in a],['gpt-6.2-sol','gpt-6.2-astra','gpt-6-luna'])
+ def test_impl_codex_only_all_three_unavailable_fails(self):
+  (self.state/'agent-dispatch').mkdir(parents=True,exist_ok=True); (self.state/'agent-dispatch'/'impl-codex-only').touch()
+  r=self.run_dispatch('impl_codex_chain_fail'); self.assertNotEqual(r.returncode,0); self.assertNotIn('claude primary',self.calls())
+  self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a and '--ignore-user-config' not in a],['gpt-6.2-sol','gpt-6.2-astra','gpt-6-luna'])
  def test_partial_implementation_never_retried(self):
   r=self.run_dispatch('impl_dirty'); self.assertNotEqual(r.returncode,0); self.assertNotIn('claude primary',self.calls()); self.assertEqual((self.home/'.worktrees/proj-issue-1/partial.txt').read_text(),'keep me\n')
  def test_denial_never_retried(self):

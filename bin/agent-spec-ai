@@ -10,11 +10,11 @@ case "${1:-status}" in
   status) ;;
   *) echo "使い方: agent-spec-ai [review-codex|review-claude|status]" >&2; exit 2 ;;
 esac
-echo "spec: claude-opus-5-5。利用不可なら codex (gpt-6-luna、次に gpt-6.1-terra)。いずれも利用できなければ報告して停止"
+echo "spec: claude-opus-5-5 → fable。利用不可なら codex (gpt-6-luna、次に gpt-6.1-terra)。いずれも利用できなければ報告して停止"
 if [[ -e $D/impl-codex-only ]]; then
-  echo "impl: gpt-6-luna。利用不可なら gpt-6.1-terra。Claude へは切り替えない"
+  echo "impl: gpt-6.2-sol → gpt-6.2-astra → gpt-6-luna。Claude へは切り替えない"
 else
-  echo "impl: gpt-6-luna。利用不可なら claude-sonnet-5-5"
+  echo "impl: gpt-6.2-sol → gpt-6.2-astra → gpt-6-luna。すべて利用不可なら claude-sonnet-5-5 → claude-opus-5-5 → fable"
 fi
-if [[ -e $R ]]; then echo "review: codex。Claude へは切り替えない"
-else echo "review: 実装していない AI (agent:review は claude。利用不可なら codex)"; fi
+if [[ -e $R ]]; then echo "review: codex。利用不可なら claude (claude-opus-5-5 → fable)"
+else echo "review: 実装していない AI (agent:review は claude)。claude は claude-opus-5-5 → fable。利用不可ならもう片方の AI"; fi
