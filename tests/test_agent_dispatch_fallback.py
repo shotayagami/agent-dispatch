@@ -123,7 +123,7 @@ class DispatchTest(DispatchFixture):
   r=self.run_dispatch('spec_primary'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('着手: claude (spec)',self.comments()); self.assertIn('完了: claude (spec)',self.comments()); self.assertNotIn('codex',self.calls())
   args=self.claude_args()[0]; self.assertEqual(args[args.index('--model')+1],'claude-opus-5-5'); self.assertIn('--restricted',args); self.assertEqual(args[args.index('--tools')+1],'Read,Grep,Glob,Write,Skill')
   prompt=args[args.index('-p')+1]; self.assertIn('Bash は使えない',prompt); self.assertNotIn('Bash で実行できるのは',prompt)
-  self.assertIn('Skill ツールで yomiyasu を呼び',prompt); self.assertIn('```verify の囲みの中身',prompt)
+  self.assertIn('Skill ツールで yomiyasu を呼び',prompt); self.assertIn('本文だけを返す指定',prompt); self.assertIn('```verify の囲みの中身',prompt)
  def test_spec_posts_decision_as_separate_comment(self):
   r=self.run_dispatch('spec_decision'); self.assertEqual(r.returncode,0,r.stderr)
   posted=[x for x in self.comments().split('\n\x1e\n') if x.strip()]
@@ -161,7 +161,7 @@ class DispatchTest(DispatchFixture):
  def test_codex_spec_prompt_reads_yomiyasu_skill_file(self):
   r=self.run_dispatch('spec_claude_unavailable'); self.assertEqual(r.returncode,0,r.stderr)
   prompt=self.codex_args()[0][-1]
-  self.assertIn(str(self.home/'.codex/skills/yomiyasu/skills/yomiyasu/SKILL.md'),prompt); self.assertIn('run --stdin --no-record',prompt); self.assertIn('```verify の囲みの中身',prompt); self.assertNotIn('Skill ツール',prompt)
+  self.assertIn(str(self.home/'.codex/skills/yomiyasu/skills/yomiyasu/SKILL.md'),prompt); self.assertIn('run --stdin --no-record',prompt); self.assertIn('本文だけを返す指定',prompt); self.assertIn('```verify の囲みの中身',prompt); self.assertNotIn('Skill ツール',prompt)
  def test_spec_falls_back_to_codex_terra(self):
   r=self.run_dispatch('spec_luna_unavailable'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual([a[a.index('--model')+1] for a in self.claude_args()],['claude-opus-5-5','fable']); self.assertEqual([a[a.index('-m')+1] for a in self.codex_args() if '-m' in a],['gpt-6-luna','gpt-6.1-terra']); self.assertIn('完了: codex (spec)',self.comments())
  def test_spec_denial_does_not_trigger_fallback(self):

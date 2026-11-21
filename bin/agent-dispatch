@@ -297,7 +297,7 @@ if [[ $LABEL == agent:spec ]]; then
   mv "$WORK/issue.md" "$WORK/repo/.agent-issue.md"
   cd "$WORK/repo" || exit 1
   # 仕様のコメントは日本語の文書なので、yomiyasu で推敲させる。Claude には Bash がないので、検査スクリプトの代わりにスキルの目視の点検を使う。
-  SPEC_YOMI='- 仕様を書き終えたら、.agent-spec-comment.md に書く前に Skill ツールで yomiyasu を呼び、本文を推敲する。Bash がないので検査スクリプトは動かせない。スキルにある目視の点検で代える。'
+  SPEC_YOMI='- 仕様を書き終えたら、.agent-spec-comment.md に書く前に Skill ツールで yomiyasu を呼び、本文を推敲する。Bash がないので検査スクリプトは動かせない。スキルにある目視の点検で代える。コメントは本文だけを返す指定として扱い、スキルの出力形式にある「変えたところ」や「確認の記録」などの欄は付けない。'
   SPEC_KEEP='見出し、項目の名前、```verify の囲みの中身、コマンド、パス、識別子、数値は変えない。'
   SPEC_BASH='- Bash で実行できるのは git status / git log / git show / git grep / git ls-files / ls / cat だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は git show または cat、検索は git grep で読む。'
   PROMPT="作業ディレクトリは $REPO ($FORGE) を clone したものです。.agent-issue.md に Issue $REPO#$NUM の本文とコメントがあります。
@@ -341,7 +341,7 @@ $SPEC_YOMI$SPEC_KEEP
     echo "Claude unavailable; switching specification to Codex Luna" >>"$LOG"
     SPEC_AI=codex; WHO='codex (spec)'
     CODEX_PROMPT="${PROMPT/結果を .agent-spec-comment.md に Write で書いてください。/結果の本文だけを日本語で最終回答として出力してください。}"
-    CODEX_PROMPT="${CODEX_PROMPT/"$SPEC_YOMI"/- 仕様を書き終えたら、出力する前に $HOME/.codex/skills/yomiyasu/skills/yomiyasu/SKILL.md を読み、その手順で本文を推敲する。ファイルを書けないので、検査スクリプトは run --stdin --no-record で動かす。}"
+    CODEX_PROMPT="${CODEX_PROMPT/"$SPEC_YOMI"/- 仕様を書き終えたら、出力する前に $HOME/.codex/skills/yomiyasu/skills/yomiyasu/SKILL.md を読み、その手順で本文を推敲する。ファイルを書けないので、検査スクリプトは run --stdin --no-record で動かす。出力は本文だけを返す指定として扱い、スキルの出力形式にある「変えたところ」や「確認の記録」などの欄は付けない。}"
     CODEX_PROMPT+=$'\nファイルを作成・変更しないでください。\n'
     # Claude 用 agent 定義の Opus 指定は Codex のモデル選択と矛盾するため、本文の役割だけを渡す。
     CODEX_PROMPT+="$(ROLE spec | sed '/^# 仕様策定は Opus/d')"
