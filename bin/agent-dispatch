@@ -56,10 +56,46 @@ live() {  # live <forge> <repo> <番号> <ラベル>
   else tea api --login gitea-home "/repos/$2/issues/$3" | jq -er '.state + " " + ([.labels[].name] | join(" "))'; fi \
     | grep -Eiq "^open( .*)? $4( |\$)"
 }
+# 閉じていない着手のコメントがあれば拾わない (agent-collaboration.md)。閉じた印は「完了:」「中断:」の行と、レビューの結果の末尾の行。
+# 着手の名義は区別できない (この script も手作業のエージェントも同じ形で書き、Gitea は全員同じ名義) ので、利用者名義の着手はすべて数える。
+declare -A ME_OF
+claim_open() {  # claim_open <forge> <repo> <番号>   開いた着手があれば 0、なければ 1、読めなければ 2
+  local me comments state
+  if [[ -z ${ME_OF[$1]:-} ]]; then
+    if [[ $1 == github ]]; then me="$(gh api user --jq .login)"; else me="$(tea api --login gitea-home /user | jq -er .login)"; fi || return 2
+    ME_OF[$1]=$me
+  fi
+  if [[ $1 == github ]]; then comments="$(gh api --paginate "repos/$2/issues/$3/comments")"
+  else comments="$(tea api --login gitea-home "/repos/$2/issues/$3/comments")"; fi || return 2
+  state="$(jq -rs --arg me "${ME_OF[$1]}" '[.[][] | select(.user.login == $me) | .body]
+    | reduce .[] as $b ("closed"; if ($b | test("(^|\n)((完了|中断)[:：]|レビュー: .*対象コミット)")) then "closed" elif ($b | test("^\\s*着手[:：]")) then "open" else . end)' <<<"$comments")" || return 2
+  case $state in open) return 0;; closed) return 1;; *) return 2;; esac
+}
+# 止まったことは Issue と ntfy で 1 度だけ知らせる (10 分ごとに同じ知らせを重ねない)
+claim_wait() {  # claim_wait <forge> <repo> <番号> <ラベル> <URL>
+  local mark="$STATE/claim-open/${1}_${2//\//_}_$3" body
+  [[ -e $mark ]] && return 0
+  body="## 判断待ち
+- 操作: \`$4\` の処理を始める
+- 必要な理由: 閉じていない着手のコメントがある。別の作業と重なるおそれがあるので、ラベルを残したまま止めている
+- 選択肢: その作業が終わっていれば、着手を「完了」か「中断」のコメントで閉じる (推奨) / 続いていれば待つ
+- 実行するときに測り直すこと: 着手のコメントのあとに「完了」か「中断」のコメントがあるか
+- 待つ間に進める作業: なし
+
+着手を閉じると、次の起動でこのラベルを拾います。"
+  if [[ $1 == github ]]; then gh api -X POST "repos/$2/issues/$3/comments" -f body="$body" >/dev/null
+  else tea comment --login gitea-home --repo "$2" "$3" "$body" >/dev/null; fi || return 1
+  agent-notify "判断待ち: $2#$3" "閉じていない着手があるので $4 を始めていません" "$5" || true
+  mkdir -p "$STATE/claim-open" && : > "$mark"
+}
 LABEL=""
 while IFS="$US" read -r l f r n u t; do
-  if live "$f" "$r" "$n" "$l"; then LABEL=$l FORGE=$f REPO=$r NUM=$n URL=$u TITLE=$t; break; fi
-  echo "飛ばす (ラベルが既に無い): $r#$n"
+  if ! live "$f" "$r" "$n" "$l"; then echo "飛ばす (ラベルが既に無い): $r#$n"; continue; fi
+  claim_open "$f" "$r" "$n"; crc=$?
+  if (( crc == 1 )); then rm -f "$STATE/claim-open/${f}_${r//\//_}_$n"; LABEL=$l FORGE=$f REPO=$r NUM=$n URL=$u TITLE=$t; break; fi
+  if (( crc == 2 )); then echo "飛ばす (コメントを読めない): $r#$n"; continue; fi
+  echo "飛ばす (閉じていない着手がある): $r#$n"
+  claim_wait "$f" "$r" "$n" "$l" "$u" || echo "判断待ちを投稿できませんでした: $r#$n" >&2
 done <<<"$CANDS"
 [[ -n "$LABEL" ]] || exit 0
 # 1 日の上限: AI の起動回数 (impl の検証失敗後の再実装も 1 回に数える) が上限に達したら、ラベルを外さずに止める。翌日に自動で再開する。
@@ -291,7 +327,7 @@ $review_bash"
   printf '\n\n---\nレビュー: %s (対象コミット %s。これより後の push は見ていません)。マージは人が行います。\n' "$reviewer" "${head:0:12}" >> .agent-review.md
   [[ $reviewer == "${IMPLEMENTER:-}" ]] && printf '注意: 実装と同じ AI (%s) によるレビューで、独立レビューではありません。\n' "$reviewer" >> .agent-review.md
   comment .agent-review.md "$1" || { REVIEW="レビューを PR に投稿できませんでした (ログ $LOG)"; return 1; }
-  REVIEW="$(grep -o '判定: *[^ ]*' .agent-review.md | tail -1)"
+  REVIEW="$(grep -o '判定: *[^ ]*' .agent-review.md | tail -1)"; REVIEWER=$reviewer
 }
 
 # ---------------------------------------------------------------- agent:spec
@@ -393,6 +429,8 @@ if [[ $LABEL == agent:review ]]; then
   cd "$WORK/repo" || exit 1
   { git fetch -q origin "+refs/pull/$NUM/head:refs/heads/agent-review-pr" && git checkout -q agent-review-pr; } 2>>"$LOG" || fail "PR の head を取得できませんでした。"
   review "$NUM" "$BASE" ".agent-issue.md に PR のタイトル・本文・コメント (利用者の名義のもの) があります。" || fail "$REVIEW"
+  # 着手を閉じる (impl は done.md で閉じる)
+  printf '完了: %s (review)。%s\n' "$REVIEWER" "$REVIEW" > "$WORK/done.md"; comment "$WORK/done.md"
   agent-notify "レビューしました: $REPO#$NUM" "$TITLE / $REVIEW" "$URL"
   echo "完了: $URL"; exit 0
 fi

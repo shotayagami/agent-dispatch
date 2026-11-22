@@ -22,7 +22,11 @@ if name=='tea':
   match=('labels='+label) in url
   print(json.dumps([{'repository':{'full_name':'gitea/proj'},'number':1,'title':'Test task','labels':[{'name':label}]}] if match else [])); sys.exit(0)
  if url=='/user': print('{"login":"tester"}'); sys.exit(0)
- if url.endswith('/issues/1/comments'): print('[]'); sys.exit(0)
+ if url.endswith('/issues/1/comments'):
+  claim={'user':{'login':'tester'},'body':'着手: codex / ブランチ feat/issue-1 / worktree w','created_at':'t'}
+  closed={'claim_closed':{'user':{'login':'tester'},'body':'完了: codex (impl)。PR: x','created_at':'t'},
+          'claim_reviewed':{'user':{'login':'tester'},'body':'## レビュー\n判定: 問題なし\n\n---\nレビュー: claude (対象コミット abc。これより後の push は見ていません)。','created_at':'t'}}
+  print(json.dumps([claim,closed[scenario]] if scenario in closed else [claim] if scenario=='claim_open' else [])); sys.exit(0)
  if url.endswith('/issues/1'): print(json.dumps({'state':'open','labels':[{'name':label}],'user':{'login':'tester'},'title':'Test task','body':'## 仕様\nImplement the issue.'})); sys.exit(0)
  if url.endswith('/pulls/1'): print('{"user":{"login":"tester"},"base":{"ref":"main"}}'); sys.exit(0)
  if url.endswith('/pulls'): (state/'pr_create.json').write_text(sys.stdin.read()); print('{"number":45}'); sys.exit(0)
@@ -174,6 +178,16 @@ class DispatchTest(DispatchFixture):
   r=self.run_dispatch('spec_both_fail'); self.assertNotEqual(r.returncode,0); self.assertEqual(len(self.codex_args()),2); self.assertIn('中断: codex (spec)',self.comments())
  def test_standalone_review_falls_back(self):
   r=self.run_dispatch('review_fallback'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('codex readonly',self.calls()); self.assertIn('レビュー: codex',self.comments()); self.assertNotIn('-m',self.codex_args()[0])
+ def test_open_claim_keeps_label_and_waits_once(self):
+  r=self.run_dispatch('claim_open'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('閉じていない着手',r.stdout)
+  self.assertNotIn('codex',self.calls()); self.assertNotIn('着手: codex (impl)',self.comments()); self.assertEqual(self.comments().count('## 判断待ち'),1)
+  r=self.run_dispatch('claim_open'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.comments().count('## 判断待ち'),1)
+ def test_closed_claim_is_picked_up(self):
+  r=self.run_dispatch('claim_closed'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('着手: codex (impl)',self.comments()); self.assertNotIn('## 判断待ち',self.comments())
+ def test_claim_closed_by_review_result_is_picked_up(self):
+  r=self.run_dispatch('claim_reviewed'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('着手: codex (impl)',self.comments()); self.assertNotIn('## 判断待ち',self.comments())
+ def test_standalone_review_closes_claim(self):
+  r=self.run_dispatch('review_success'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('完了: claude (review)。判定: 問題なし',self.comments())
  def test_review_prompt_matches_allowed_tools(self):
   r=self.run_dispatch('review_fallback'); self.assertEqual(r.returncode,0,r.stderr); args=self.claude_args()[0]; allowed=args[args.index('--allowedTools')+1]; prompt=args[args.index('-p')+1]
   self.assertIn('Bash(git status:*)',allowed); self.assertNotIn('Bash(cat',allowed); self.assertIn('git status /',prompt); self.assertNotIn('/ cat',prompt); self.assertIn('/ cat',self.codex_args()[0][-1])
