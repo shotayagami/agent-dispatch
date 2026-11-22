@@ -1,10 +1,10 @@
 # ラベルで AI に作業を任せる仕組み
 
-最終確認: 2026-11-14。cg-dev の `~/bin/agent-dispatch` と補助スクリプトを読んで書いた。
+最終確認: 2026-11-14。実行ホストの `~/bin/agent-dispatch` と補助スクリプトを読んで書いた。
 
 ## 概要
 
-GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 分ごとに動く `agent-dispatch` がそれを拾い、Codex または Claude に作業を渡す。1 回の起動で処理するのは 1 件だけで、PR のマージは人が行う。
+GitHub と Gitea の Issue や PR にラベルを付けると、実行ホストで 10 分ごとに動く `agent-dispatch` がそれを拾い、Codex または Claude に作業を渡す。1 回の起動で処理するのは 1 件だけで、PR のマージは人が行う。
 
 対象は `AGENT_GH_OWNER` に設定した GitHub のオーナー配下と、Gitea の全リポジトリである。
 
@@ -12,7 +12,7 @@ GitHub と Gitea の Issue や PR にラベルを付けると、cg-dev で 10 �
 
 | 要素 | 実体 |
 |---|---|
-| 実行ホスト | cg-dev |
+| 実行ホスト | Proxmox 上の LXC コンテナ（README の「実行環境」） |
 | 起動 | systemd ユーザータイマー `agent-dispatch.timer`（`OnCalendar=*:0/10`）。service は oneshot で `TimeoutStartSec=65min` |
 | 本体 | `~/bin/agent-dispatch` |
 | 補助 | `agent-notify`（ntfy 通知）、`agent-impl-ai`、`agent-spec-ai`（担当の切り替え）、`agent-dispatch-handoff`（pr-fix の途中作業の引き継ぎ）、`agent-dispatch-verify`（impl の実装後の検証） |
