@@ -1,5 +1,5 @@
 [Unit]
-Description=Detect failing CI and stale PRs, open Issues (no AI)
+Description=Detect failing CI, stale PRs, alerts and security findings, open Issues
 
 [Service]
 Type=oneshot
