@@ -38,6 +38,17 @@ service は PATH に nvm の node の `bin` を含めています。別の環境
 | `NTFY_AGENT_URL` | ntfy の URL |
 | `NTFY_AGENT_TOPIC` | ntfy のトピック名（省略時は `agent-decisions`） |
 
+`agent-detect` のアラートとセキュリティの検出は、次の変数で取得元を指定します。置き場所か取得元の変数が空なら、その取得元は読みません。
+
+| 変数 | 内容 |
+|---|---|
+| `AGENT_DETECT_ALERT_REPO` | アラートとセキュリティの Issue の置き場所（`github <owner>/<name>`）。`~/.config/agent-detect/repos` にも載せる |
+| `AGENT_DETECT_ZBX_URL` | Zabbix の API の URL。トークンは `AGENT_DETECT_ZBX_ENV`（省略時は `~/.env`）の `ZBX_API_TOKEN` から読む |
+| `AGENT_DETECT_WAZUH_SSH` | Wazuh の indexer があるホストへの SSH 先。資格情報は `AGENT_DETECT_WAZUH_ENV`（省略時は `~/.env.claude-work`）の `WAZUH_INDEXER_USER` と `WAZUH_INDEXER_PASS` から読む |
+| `AGENT_DETECT_SR_URL` | SimpleRisk の URL。資格情報は `AGENT_DETECT_SR_ENV`（省略時は `~/.env.simplerisk`）の `CF_ACCESS_CLIENT_ID`、`CF_ACCESS_CLIENT_SECRET`、`SIMPLERISK_USER`、`SIMPLERISK_PASS` から読む |
+
+Alertmanager は `kubectl get --raw` でクラスタのサービスを経由して読むので、実行するホストに kubeconfig が要ります。
+
 `worktree-cleanup` も `AGENT_GITEA_GIT` を読みます。Gitea の PR を確かめるとき、接続先のホストがこのホストと同じで、`~/.env` に `GITEA_API_KEY=<トークン>` の行があれば、そのトークンで API を呼びます。トークンはコマンドの引数に出さず、標準入力から curl に渡します。どちらかが無ければ、これまでどおり `~/.netrc` で認証します。
 
 ## サンプルについて

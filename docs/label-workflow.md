@@ -123,6 +123,24 @@ AI を使わずに、仕事の候補を見つけて Issue にする。毎時、�
 
 2 回続けて見えたものだけを、各リポジトリに Issue として作る。ラベルは付けないので、仕様化を頼むときは人が `agent:spec` を付ける。同じ検出の Issue が開いていれば重複して作らない。検出が解消したら、コメントを付けて閉じる。取得に失敗したリポジトリは「不明」として扱い、Issue を閉じない。Issue を作ったときだけ ntfy に知らせる。`agent-detect --dry-run` は検出結果を表示するだけである。
 
+### アラートとセキュリティの検出
+
+`AGENT_DETECT_ALERT_REPO` に置き場所のリポジトリを設定すると、次の検出も Issue にする。置き場所は GitHub に限る。取得元ごとの設定は README の「設定」にある。
+
+| 取得元 | 対象 | 1 件の単位 | ラベル |
+|---|---|---|---|
+| Alertmanager | 発火中のアラート（Watchdog と InfoInhibitor、重大度 none と info を除く） | アラート名・名前空間・対象 | `incident` |
+| Zabbix | 重大度が Average 以上の障害 | トリガー | `incident` |
+| Wazuh | 修正版のある Critical と High の脆弱性 | ホスト × パッケージ | `security` |
+| SimpleRisk | 閉じていないリスク | リスク | `security` |
+
+- `incident` の Issue は、作ったあとに claude -p が読み取りだけで調査し、結果をコメントする。1 回の起動で 3 件までである。`security` の Issue は調査しない。
+- 閉じた Issue と同じ検出がまた見えたら、新しく作らずに開き直し、再発の回数をコメントに書く。
+- 取得に失敗した取得元の Issue は閉じない。
+- Wazuh は、修正版があるかを `vulnerability.scanner.condition` で判定し、`Package default status` のものは数えない。indexer が Wazuh のホストの `127.0.0.1` だけで待ち受ける構成を前提に、起動のたびに SSH のポート転送を張り、読み終えたら閉じる。
+- SimpleRisk は、API Extra がなくても読めるように、ログインしたセッションで `/api/v2/risks` を読む。Cloudflare Access の後ろにある前提で、サービストークンのヘッダを付ける。
+- 資格情報とセッションの Cookie は、権限 700 の一時ディレクトリのファイルから渡し、コマンドの引数に出さない。
+
 ## 安全のための制限
 
 - 利用者以外が作った PR は、`agent:review` でも `agent:pr-fix` でも扱わない。差分や本文が指示として読まれるのを避けるためである。ただし Gitea は全員が同じ `gitea` 名義で書き込まれるため、Gitea 上では作成者による絞り込みが効かない。外部の人の報告を依頼するときは、利用者が内容をコメントに書き直してからラベルを付ける。

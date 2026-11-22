@@ -1,7 +1,9 @@
 #!/bin/bash
-# 仕事の検出ループ (定期起動用)。既定ブランチの CI 失敗と、放置された自分の PR を見つけ、各リポジトリに Issue を作る。
-# Issue にはラベルを付けない。agent:spec を付けるかは人が決める (agent-collaboration.md)。
-# 検出は機械的に行い、AI は使わない。2 回続けて見えたものだけを Issue にし、解消したら Issue を閉じる。
+# 仕事の検出ループ (定期起動用)。既定ブランチの CI 失敗と、放置された自分の PR と、発火中のアラート (Alertmanager・Zabbix) と、
+# セキュリティの検出 (Wazuh の修正版のある Critical・High の脆弱性、SimpleRisk の閉じていないリスク) を見つけ、Issue を作る。
+# CI と PR の Issue にはラベルを付けない (agent:spec を付けるかは人が決める)。アラートの Issue には incident を付け、再発時は閉じた Issue を開き直し、claude -p に読み取りだけの調査をさせる。
+# セキュリティの Issue には security を付け、再発時は開き直す。調査はさせない。
+# 検出は機械的に行い、AI は使わない (AI はアラートの Issue の調査だけ)。2 回続けて見えたものだけを Issue にし、解消したら Issue を閉じる。
 # 決まり: ~/.claude/rules/agent-autonomy.md (Issue の作成と、自分が作った Issue を閉じることは ②)
 # 対象: ~/.config/agent-detect/repos (1 行 1 リポジトリ: "github owner/name" または "gitea owner/name")
 # 使い方: agent-detect [--dry-run]   (--dry-run は検出結果を表示するだけで、Issue も状態も変えない)
@@ -28,7 +30,7 @@ CUR="$STATE/current.new"; DETAIL="$STATE/detail.new"; UNSURE="$STATE/unsure.new"
 : > "$CUR"; : > "$DETAIL"; : > "$UNSURE"
 US=$'\x1f'
 # add_finding <key> <forge> <repo> <タイトル> <本文>   (本文は改行を \n で持ち、後で戻す)
-add_finding() { echo "$1" >> "$CUR"; printf '%s\n' "$1$US$2$US$3$US$4$US$5" >> "$DETAIL"; }
+add_finding() { grep -qxF "$1" "$CUR" && return; echo "$1" >> "$CUR"; printf '%s\n' "$1$US$2$US$3$US$4$US$5" >> "$DETAIL"; }
 
 declare -A ME
 while read -r forge repo; do
@@ -55,18 +57,133 @@ while read -r forge repo; do
   done
 done < "$CONF"
 
+# アラート: Alertmanager と Zabbix で発火中のものを、ALERT_LABEL 付きの Issue にする (ALERT_REPO は CONF にも載っていること)
+# shortcut: ラベルを名前で渡すので ALERT_REPO は GitHub に限る (Gitea はラベル ID が要る)
+ALERT_REPO="${AGENT_DETECT_ALERT_REPO-}"   # 空なら取得しない
+ALERT_LABEL=incident
+ZBX_URL="${AGENT_DETECT_ZBX_URL-}"   # 空なら取得しない
+ZBX_ENV="${AGENT_DETECT_ZBX_ENV:-$HOME/.env}"
+ZBX_MIN_SEV="${AGENT_DETECT_ZBX_MIN_SEV:-3}"   # 3=Average 以上
+AM_PATH='/api/v1/namespaces/monitoring/services/prometheus-stack-kube-prom-alertmanager:9093/proxy/api/v2/alerts?active=true&silenced=false&inhibited=false'
+AUNSURE="$STATE/alert-unsure.new"; : > "$AUNSURE"   # 取得に失敗した取得元 ("alert am" / "alert zbx")。その Issue は閉じない
+# 値に入った改行・タブ・\x1f・バックスラッシュは行の区切りと printf %b を壊すので空白にする
+JQ_CLEAN='def c: tostring | gsub("[\\\\\n\r\t\u001f]"; " ");'
+if [[ -n "$ALERT_REPO" ]]; then
+  read -r af ar <<<"$ALERT_REPO"
+  am="$(kubectl get --raw "$AM_PATH" 2>/dev/null)"
+  if jq -e 'type == "array"' <<<"$am" >/dev/null 2>&1; then
+    # 同じ CronJob の別 Job や同じ Deployment の別 Pod を 1 件にまとめるため、対象は所有者側の名前を優先する
+    jq -r "$JQ_CLEAN"' .[] | .labels as $l
+      | select(($l.alertname | IN("Watchdog", "InfoInhibitor") | not) and (($l.severity // "warning") | IN("none", "info") | not))
+      | (($l.job_name | values | sub("-[0-9]+$"; "")) // $l.deployment // $l.statefulset // $l.daemonset // $l.persistentvolumeclaim
+         // $l.container // $l.node // $l.instance // $l.pod // "-" | c | gsub(" "; "_")) as $t
+      | ($l.namespace // "-" | c | gsub(" "; "_")) as $ns
+      | ["alert am \($l.alertname | c | gsub(" "; "_")) \($ns) \($t)",
+         "アラート \($l.alertname | c) (\($ns) \($t))",
+         "Alertmanager で次のアラートが発火しています。\\n\\n- アラート: \($l.alertname | c)\\n- 重大度: \($l.severity // "-" | c)\\n- 対象: \($ns) / \($t)\\n- 発火開始: \(.startsAt)\\n- 概要: \(.annotations.summary // .annotations.description // .annotations.message // "-" | c)\\n- ラベル: `\($l | to_entries | map("\(.key)=\(.value)") | join(", ") | c)`"]
+      | join("\u001f")' <<<"$am" | while IFS=$'\x1f' read -r key title body; do
+      add_finding "$key" "$af" "$ar" "$TITLE_PREFIX $title" "$body\n\n調査の結果はこの Issue のコメントに書きます。"
+    done
+  else echo "alert am" >> "$AUNSURE"; fi
+
+  if [[ -n "$ZBX_URL" ]]; then   # 空なら Zabbix は取得しない
+  tok="$(grep -m1 '^ZBX_API_TOKEN=' "$ZBX_ENV" 2>/dev/null | cut -d= -f2- | tr -d "\"'")"
+  zb=""
+  # トークンは ps に出ないよう -H @ でファイル記述子から渡す
+  [[ -n "$tok" ]] && zb="$(jq -nc --argjson s "$ZBX_MIN_SEV" '{jsonrpc:"2.0", method:"trigger.get", id:1, params:{output:["triggerid","description","priority","lastchange"], filter:{value:1}, monitored:true, skipDependent:true, min_severity:$s, expandDescription:true, selectHosts:["name"]}}' \
+    | curl -sk --max-time 30 -H @<(printf 'Authorization: Bearer %s\n' "$tok") -H 'Content-Type: application/json-rpc' -d @- "$ZBX_URL" 2>/dev/null)"
+  unset tok
+  if jq -e '.result | type == "array"' <<<"$zb" >/dev/null 2>&1; then
+    jq -r "$JQ_CLEAN"' .result[] | (.hosts[0].name // "-" | c) as $h
+      | (["-","Information","Warning","Average","High","Disaster"][.priority | tonumber] // .priority) as $sev
+      | ["alert zbx \(.triggerid)",
+         "Zabbix \($h): \(.description | c | .[0:100])",
+         "Zabbix で次の障害が発生しています。\\n\\n- ホスト: \($h)\\n- トリガー: \(.description | c)\\n- 重大度: \($sev)\\n- 発生: \(.lastchange | tonumber | strflocaltime("%Y-%m-%d %H:%M"))\\n- triggerid: \(.triggerid)"]
+      | join("\u001f")' <<<"$zb" | while IFS=$'\x1f' read -r key title body; do
+      add_finding "$key" "$af" "$ar" "$TITLE_PREFIX $title" "$body\n\n調査の結果はこの Issue のコメントに書きます。"
+    done
+  else echo "alert zbx" >> "$AUNSURE"; fi
+  fi
+fi
+
+# セキュリティ: Wazuh と SimpleRisk の検出を、SEC_LABEL 付きの Issue にする (置き場所は ALERT_REPO と同じ)。取得に失敗した取得元 ("sec wz" / "sec sr") の Issue は閉じない
+SEC_LABEL=security
+WZ_SSH="${AGENT_DETECT_WAZUH_SSH-}"   # 空なら取得しない。indexer は VM の 127.0.0.1 だけで待つので SSH の転送で読む
+WZ_ENV="${AGENT_DETECT_WAZUH_ENV:-$HOME/.env.claude-work}"
+WZ_PORT="${AGENT_DETECT_WAZUH_PORT:-19201}"
+SR_URL="${AGENT_DETECT_SR_URL-}"   # 空なら取得しない
+SR_ENV="${AGENT_DETECT_SR_ENV:-$HOME/.env.simplerisk}"
+envv() { grep -m1 "^$2=" "$1" 2>/dev/null | cut -d= -f2- | sed -E "s/^[\"']//; s/[\"']\$//"; }   # 値に記号を含むので source しない
+if [[ -n "$ALERT_REPO" ]]; then
+  read -r af ar <<<"$ALERT_REPO"
+  SECRET="$(mktemp -d)"; chmod 700 "$SECRET"   # 資格情報と Cookie は ps に出ないようファイルで渡し、最後に消す
+
+  if [[ -n "$WZ_SSH" ]]; then
+    wz=""; u="$(envv "$WZ_ENV" WAZUH_INDEXER_USER)"; p="$(envv "$WZ_ENV" WAZUH_INDEXER_PASS)"
+    printf 'user = "%s"\n' "$(printf '%s:%s' "$u" "$p" | sed 's/[\\"]/\\&/g')" > "$SECRET/wz.curlrc"; unset p
+    # 修正版がない (判定が "Package default status") ものは数えない。ホスト × パッケージで 1 件にまとめる
+    # shortcut: composite は 1000 組まで (2026-11-23 の実測は約 30 組)。超えたら after_key でページを送る
+    q='{"size":0,"query":{"bool":{"filter":[{"terms":{"vulnerability.severity":["Critical","High"]}}],"must_not":[{"term":{"vulnerability.scanner.condition":"Package default status"}}]}},
+      "aggs":{"g":{"composite":{"size":1000,"sources":[{"a":{"terms":{"field":"wazuh.agent.name"}}},{"p":{"terms":{"field":"package.name"}}}]},
+      "aggs":{"sev":{"terms":{"field":"vulnerability.severity"}},"cve":{"terms":{"field":"vulnerability.id","size":50}},"ver":{"terms":{"field":"package.version","size":3}},"cond":{"terms":{"field":"vulnerability.scanner.condition","size":3}}}}}}'
+    if [[ -n "$u" ]] && ssh -M -S "$SECRET/wz.sock" -fN -o BatchMode=yes -o ConnectTimeout=10 -o ExitOnForwardFailure=yes -L "$WZ_PORT:127.0.0.1:9200" "$WZ_SSH" 2>/dev/null; then
+      wz="$(curl -skg --max-time 60 -K "$SECRET/wz.curlrc" -H 'Content-Type: application/json' -d "$q" "https://127.0.0.1:$WZ_PORT/wazuh-states-vulnerabilities*/_search" 2>/dev/null)"
+      ssh -S "$SECRET/wz.sock" -O exit "$WZ_SSH" 2>/dev/null
+    fi
+    unset u
+    if jq -e '.aggregations.g.buckets | type == "array"' <<<"$wz" >/dev/null 2>&1; then
+      jq -r "$JQ_CLEAN"' .aggregations.g.buckets[] | (.key.a | c) as $a | (.key.p | c) as $p
+        | (if any(.sev.buckets[]; .key == "Critical") then "Critical" else "High" end) as $s
+        | ([.cve.buckets[].key | c]) as $cves
+        | ["sec wz \($a | gsub(" "; "_")) \($p | gsub(" "; "_"))",
+           "Wazuh \($a): \($p) に修正版のある脆弱性 (\($s))",
+           "Wazuh が、修正版のある脆弱性を検出しています。\\n\\n- ホスト: \($a)\\n- パッケージ: \($p) (\([.ver.buckets[].key | c] | join(", ")))\\n- 重大度: \($s)\\n- 修正の条件: \([.cond.buckets[].key | c] | join(" / "))\\n- CVE: \($cves[0:10] | join(", "))\(if ($cves | length) > 10 then " ほか \(($cves | length) - 10) 件" else "" end)\\n\\nパッケージの更新で直ります。仕様化を依頼するときは `agent:spec` を付けてください。"]
+        | join("\u001f")' <<<"$wz" | while IFS=$'\x1f' read -r key title body; do
+        add_finding "$key" "$af" "$ar" "$TITLE_PREFIX $title" "$body"
+      done
+    else echo "sec wz" >> "$AUNSURE"; fi
+  fi
+
+  if [[ -n "$SR_URL" ]]; then
+    sr=""
+    printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' "$(envv "$SR_ENV" CF_ACCESS_CLIENT_ID)" "$(envv "$SR_ENV" CF_ACCESS_CLIENT_SECRET)" > "$SECRET/sr.hdr"
+    printf '%s' "$(envv "$SR_ENV" SIMPLERISK_USER)" > "$SECRET/sr.user"; printf '%s' "$(envv "$SR_ENV" SIMPLERISK_PASS)" > "$SECRET/sr.pass"
+    # API キーが使えない (API Extra 未導入) ので、ログインしたセッションで読む。既定の UA は Cloudflare に 1010 で拒否される
+    src() { curl -s --max-time 30 -A agent-detect -H @"$SECRET/sr.hdr" -b "$SECRET/sr.jar" -c "$SECRET/sr.jar" "$@"; }
+    tok="$(src "$SR_URL/" 2>/dev/null | grep -oE 'name="csrf_token" value="[0-9a-f]{64}"' | head -1 | grep -oE '[0-9a-f]{64}')"
+    # submit=1 が無いとログイン画面が 200 で描き直されるだけ。成功は 302
+    if [[ -n "$tok" && "$(src -o /dev/null -w '%{http_code}' --data-urlencode "user@$SECRET/sr.user" --data-urlencode "pass@$SECRET/sr.pass" \
+          --data-urlencode "csrf_token=$tok" --data-urlencode submit=1 "$SR_URL/" 2>/dev/null)" == 302 ]]; then
+      sr="$(src "$SR_URL/api/v2/risks?length=1000" 2>/dev/null)"
+    fi
+    if jq -e '.data.risks | type == "array"' <<<"$sr" >/dev/null 2>&1; then
+      jq -r --arg u "$SR_URL" "$JQ_CLEAN"' .data.risks[] | select(.status != "Closed")
+        | ["sec sr \(.id)",
+           "SimpleRisk \(.reference_id // .id | c): \(.subject // "-" | c | .[0:80])",
+           "SimpleRisk に閉じていないリスクがあります。\\n\\n- 件名: \(.subject // "-" | c)\\n- 参照 ID: \(.reference_id // "-" | c) (リスク ID \(.id))\\n- 状態: \(.status | c)\\n- スコア: \(.calculated_risk // "-")\\n- 次の見直し: \(.next_review // "-" | c)\\n- 登録日: \(.submission_date // "-" | c)\\n- 画面: \($u)/management/view.php?id=\(.id)\\n\\n対応を決めて SimpleRisk の状態を進めてください。リスクが閉じると、この Issue も閉じます。"]
+        | join("\u001f")' <<<"$sr" | while IFS=$'\x1f' read -r key title body; do
+        add_finding "$key" "$af" "$ar" "$TITLE_PREFIX $title" "$body"
+      done
+    else echo "sec sr" >> "$AUNSURE"; fi
+  fi
+  rm -rf "$SECRET"
+fi
+
 sort -u -o "$CUR" "$CUR"; touch "$STATE/current"
 PERSIST="$(comm -12 "$STATE/current" "$CUR")"
 echo "検出: $(grep -c . "$CUR") 件 / 継続: $(printf '%s' "$PERSIST" | grep -c .) 件 / 取得できなかった repo: $(grep -c . "$UNSURE") 件"
 [[ -s "$UNSURE" ]] && sed 's/^/  不明: /' "$UNSURE"
+[[ -s "$AUNSURE" ]] && sed 's/^/  取得できなかったアラート: /' "$AUNSURE"
 [[ -s "$CUR" ]] && sed 's/^/  検出: /' "$CUR"
 
-created=0; closed=0; first_url=""
+created=0; closed=0; first_url=""; declare -A CLOSED=()   # ラベル → 閉じた Issue の「番号 TAB キー」
 # 検出が継続している repo ごとに、開いている agent-detect の Issue を引いて、作成と解消を判断する
 while read -r forge repo; do
   [[ -z "$forge" || "$forge" == \#* ]] && continue
   grep -qxF "$forge $repo" "$UNSURE" && continue
-  issues="$(api "$forge" GET "/repos/$repo/issues?state=open&type=issues&per_page=100&limit=100" 2>/dev/null)" || continue
+  # type=issues は Gitea だけ (GitHub は issue type と解釈して 422 を返す。PR は下の jq で除く)
+  q="state=open&per_page=100&limit=100"; [[ $forge == gitea ]] && q+="&type=issues"
+  issues="$(api "$forge" GET "/repos/$repo/issues?$q" 2>/dev/null)" || continue
   jq -e type <<<"$issues" >/dev/null 2>&1 || continue
   # 開いている agent-detect の Issue: 番号 TAB マーカーのキー (GitHub の issues には PR も混ざるので除く)
   mine="$(jq -r --arg p "$TITLE_PREFIX" '.[] | select((.pull_request // null) == null and (.title | startswith($p))) | [.number, (((.body // "") | capture("<!-- agent-detect:(?<k>[^>]*?) -->")? | .k) // "")] | join("\t")' <<<"$issues")"
@@ -74,6 +191,7 @@ while read -r forge repo; do
   while IFS=$'\t' read -r n key; do
     [[ -z "$n" || -z "$key" ]] && continue
     grep -qxF "$key" "$CUR" && continue
+    grep -qxF "$(cut -d' ' -f1-2 <<<"$key")" "$AUNSURE" && continue   # 取得に失敗したアラートは解消と区別できない
     (( DRY )) && { echo "  閉じる: $forge $repo #$n ($key)"; continue; }
     jq -nc '{body:"今回の確認で検出が解消していたため閉じます (agent-detect)。"}' | api "$forge" POST "/repos/$repo/issues/$n/comments" >/dev/null \
       && jq -nc '{state:"closed"}' | api "$forge" PATCH "/repos/$repo/issues/$n" >/dev/null && closed=$((closed+1))
@@ -83,15 +201,64 @@ while read -r forge repo; do
     [[ "$f $r" == "$forge $repo" ]] || continue
     grep -qxF "$key" <<<"$PERSIST" || continue
     cut -f2 <<<"$mine" | grep -qxF "$key" && continue
-    (( DRY )) && { echo "  作成: $forge $repo $title"; continue; }
-    # 本文の末尾に、同じ検出を二重に作らないためのマーカーを入れる
-    url="$(jq -nc --arg t "$title" --arg b "$(printf '%b\n\n<!-- agent-detect:%s -->' "$body" "$key")" '{title:$t, body:$b}' | api "$forge" POST "/repos/$repo/issues" | jq -r '.html_url // empty')"
-    if [[ -n "$url" ]]; then created=$((created+1)); [[ -z "$first_url" ]] && first_url="$url"; else echo "Issue を作れませんでした: $forge $repo $title" >&2; fi
+    label=""; case "$key" in alert\ *) label="$ALERT_LABEL";; sec\ *) label="$SEC_LABEL";; esac
+    # 再発: 同じキーの閉じた Issue があれば、新しく作らずに開き直す (同じ障害の回数を 1 件に集める)
+    reopen=""
+    if [[ -n "$label" ]]; then
+      [[ -n "${CLOSED[$label]+x}" ]] || CLOSED[$label]="$(api "$forge" GET "/repos/$repo/issues?state=closed&labels=$label&per_page=100" 2>/dev/null \
+        | jq -r '.[]? | select((.pull_request // null) == null) | [.number, (((.body // "") | capture("<!-- agent-detect:(?<k>[^>]*?) -->")? | .k) // "")] | join("\t")' 2>/dev/null)"
+      reopen="$(awk -F'\t' -v k="$key" '$2 == k {print $1; exit}' <<<"${CLOSED[$label]}")"
+    fi
+    if [[ -n "$reopen" ]]; then
+      cnt=$(( $(grep -cxF "$key" "$STATE/recur" 2>/dev/null) + 1 ))
+      (( DRY )) && { echo "  再開: $forge $repo #$reopen (再発 $cnt 回目) $title"; continue; }
+      url="$(jq -nc --arg b "$(printf '再発しました (再発 %d 回目、agent-detect)。\n\n%b' "$cnt" "$body")" '{body:$b}' | api "$forge" POST "/repos/$repo/issues/$reopen/comments" >/dev/null \
+        && jq -nc '{state:"open"}' | api "$forge" PATCH "/repos/$repo/issues/$reopen" | jq -r '.html_url // empty')"
+      [[ -n "$url" ]] && echo "$key" >> "$STATE/recur"
+    else
+      (( DRY )) && { echo "  作成: $forge $repo $title${label:+ [$label]}"; continue; }
+      # 本文の末尾に、同じ検出を二重に作らないためのマーカーを入れる
+      url="$(jq -nc --arg t "$title" --arg b "$(printf '%b\n\n<!-- agent-detect:%s -->' "$body" "$key")" --arg l "$label" '{title:$t, body:$b} + (if $l == "" then {} else {labels:[$l]} end)' | api "$forge" POST "/repos/$repo/issues" | jq -r '.html_url // empty')"
+    fi
+    if [[ -n "$url" ]]; then
+      created=$((created+1)); [[ -z "$first_url" ]] && first_url="$url"
+      [[ "$label" == "$ALERT_LABEL" ]] && echo "$url" >> "$STATE/investigate"
+    else echo "Issue を作れませんでした: $forge $repo $title" >&2; fi
   done < "$DETAIL"
+  CLOSED=()
 done < "$CONF"
 
 echo "作成: $created 件 / 閉じた: $closed 件"
 if (( DRY )); then rm -f "$CUR" "$DETAIL" "$UNSURE"; exit 0; fi
-mv "$CUR" "$STATE/current"; rm -f "$DETAIL" "$UNSURE"
-(( created > 0 )) && { agent-notify "agent-detect: Issue を $created 件作成" "CI 失敗または放置 PR を検出しました。ラベルは付けていません。" "$first_url" || true; }
+mv "$CUR" "$STATE/current"; rm -f "$DETAIL" "$UNSURE" "$AUNSURE"
+(( created > 0 )) && { agent-notify "agent-detect: Issue を $created 件作成・再開" "CI 失敗・放置 PR・アラート・セキュリティの検出です。アラートには $ALERT_LABEL、セキュリティには $SEC_LABEL ラベルを付けています。" "$first_url" || true; }
+
+# アラートの Issue を claude -p に調査させる。読み取りと Issue へのコメントだけを許し、修正はしない (agent-autonomy.md の ③)
+# 1 回に 3 件まで。残りは次の実行に回す
+touch "$STATE/investigate"
+head -n 3 "$STATE/investigate" | while read -r url; do
+  [[ -z "$url" ]] && continue
+  WORK="$(mktemp -d)"; log="$STATE/investigate-$(basename "$url").log"
+  PROMPT="サーバーのアラートから自動で作った Issue $url を調査し、結果をその Issue にコメントしてください。
+
+1. gh issue view $url --json title,body,comments で本文 (アラートの内容) と過去のコメントを読む (--comments は Projects classic のエラーで失敗する)。再発しているなら過去の調査も参考にする。続けて gh issue list --repo <同じリポジトリ> --state all --search '<アラート名や対象の語>' で、人が書いた関連 Issue を探し、あれば番号と要点を事実に書く (同じ障害を追う Issue があれば、そちらへの集約を当面の対処に入れる)。
+2. Alertmanager 由来なら kubectl の get / describe / logs / events / top で原因を調べる。許可は動詞で始まる形だけなので、名前空間は kubectl get jobs -n <ns> のように動詞の後ろに書く (kubectl -n <ns> get は拒否される)。Zabbix 由来 (PVE ホストや LXC) はここから中を見られないので、アラートの内容から考えられる原因と、人が確かめる手順を書く。
+3. 書き込みは一切しない (delete、patch、apply、rollout、scale、annotate を含む)。Secret の中身は読まない。ログに資格情報らしき値があればコメントに写さない。
+4. gh issue comment $url --body-file <ファイル> で、次の形の日本語のコメントを 1 件書く。ファイルは作業ディレクトリに Write で作る。
+   ## 調査 (agent-detect)
+   - 事実: (確かめたこと。コマンドと結果の要点)
+   - 原因の候補: (推測には推測と書く)
+   - 当面の対処: (人が実行する操作。何もしない選択肢も入れる)
+   - 恒久対策の案: (再発を止める変更。仕様化するなら agent:spec を付けるよう書く)
+5. Bash は 1 回に 1 コマンドだけ実行する。| ; && $( ) でつないだコマンドは全体ごと拒否される。
+6. 許可されていない操作が拒否されたら、言い換えて再試行せず、拒否されたことをコメントに書く。
+7. 見ている人はいない。質問や確認の依頼で終えず、確認できなかった点は未確認と書いたうえで、必ず手順 4 のコメントを投稿して終える。"
+  (cd "$WORK" && timeout 280 claude -p "$PROMPT" --restricted --strict-mcp-config --tools "Bash,Read,Write" \
+    --allowedTools "Bash(kubectl get:*) Bash(kubectl describe:*) Bash(kubectl logs:*) Bash(kubectl events:*) Bash(kubectl top:*) Bash(gh issue view:*) Bash(gh issue list:*) Bash(gh issue comment:*) Read Write" \
+    --disallowedTools "Bash(kubectl get secret:*) Bash(kubectl get secrets:*)" \
+    --permission-mode dontAsk --max-budget-usd 2 --output-format text < /dev/null) > "$log" 2>&1   # stdin を渡すと残りの URL を claude が読んでしまう
+  echo "調査: $url claude -p rc=$? (ログ: $log)"
+  rm -rf "$WORK"
+done
+sed -i '1,3d' "$STATE/investigate"
 exit 0
