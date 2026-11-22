@@ -89,7 +89,7 @@ PR 専用の worktree（`~/.worktrees/<repo>-pr-<番号>`）で、PR 本文と�
 
 作成者が利用者の PR だけを扱う。PR の head を `refs/pull/<番号>/head` から取得し、`origin/<基準ブランチ>` との差分を `.agent-diff.patch` に書いてレビューさせる。結果は `## レビュー` から始まり、最後に `判定: 問題なし` か `判定: 要修正` が付く。
 
-Claude は `claude-opus-5-5`（利用できなければ `fable`）を `--restricted` で起動し、使えるツールを読み取りと Skill、`git log`、`git show`、`git grep`、`git diff`、`git ls-files`、`ls` に限る。時間は 8 分まで、費用の上限は 3 USD である。Codex の場合も読み取り専用で、時間は 8 分までである。
+Claude は `claude-opus-5-5`（利用できなければ `fable`）を `--restricted` で起動し、使えるツールを読み取りと Skill、`git status`、`git log`、`git show`、`git grep`、`git diff`、`git ls-files`、`ls` に限る。時間は 8 分まで、費用の上限は 3 USD である。Codex の場合も読み取り専用で、時間は 8 分までである。
 
 ## 担当の切り替え
 

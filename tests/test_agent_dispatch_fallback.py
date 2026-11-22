@@ -174,6 +174,9 @@ class DispatchTest(DispatchFixture):
   r=self.run_dispatch('spec_both_fail'); self.assertNotEqual(r.returncode,0); self.assertEqual(len(self.codex_args()),2); self.assertIn('中断: codex (spec)',self.comments())
  def test_standalone_review_falls_back(self):
   r=self.run_dispatch('review_fallback'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('codex readonly',self.calls()); self.assertIn('レビュー: codex',self.comments()); self.assertNotIn('-m',self.codex_args()[0])
+ def test_review_prompt_matches_allowed_tools(self):
+  r=self.run_dispatch('review_fallback'); self.assertEqual(r.returncode,0,r.stderr); args=self.claude_args()[0]; allowed=args[args.index('--allowedTools')+1]; prompt=args[args.index('-p')+1]
+  self.assertIn('Bash(git status:*)',allowed); self.assertNotIn('Bash(cat',allowed); self.assertIn('git status /',prompt); self.assertNotIn('/ cat',prompt); self.assertIn('/ cat',self.codex_args()[0][-1])
  def test_review_exit_zero_quota_falls_back(self):
   r=self.run_dispatch('review_zero_quota'); self.assertEqual(r.returncode,0,r.stderr); self.assertIn('codex readonly',self.calls()); self.assertIn('レビュー: codex',self.comments())
  def test_review_weekly_limit_falls_back(self):
