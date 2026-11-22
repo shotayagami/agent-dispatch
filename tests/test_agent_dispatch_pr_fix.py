@@ -152,6 +152,11 @@ if args[0]=='search':
  print(json.dumps([{'repository':{'nameWithOwner':'gitea/proj'},'number':1,'url':'https://example.test/pr/1','title':'Test task','labels':[{'name':label}]}] if args[1]=='prs' and label=='agent:pr-fix' else [])); sys.exit(0)
 if args[:2]==['api','user']: print('tester');sys.exit(0)
 if args[0]=='api' and '-X' in args and 'DELETE' in args: sys.exit(0)
+if args[0]=='api' and '-X' in args and 'POST' in args:
+ (state/'comments').open('a').write(args[args.index('-f')+1]+'\\n'); sys.exit(0)
+if args[0]=='api' and args[-1].endswith('/comments'):
+ claim={'user':{'login':'tester'},'body':'着手: claude / ブランチ feat/issue-906 / worktree w'}
+ print(json.dumps([claim] if os.environ.get('MOCK_SCENARIO')=='prfix_claim_open' else [])); sys.exit(0)
 if args[0] in ('issue','pr') and args[1] in ('edit','comment'):
  if args[1]=='comment':
   path=pathlib.Path(args[args.index('--body-file')+1]); (state/'comments').open('a').write(path.read_text()+'\\n')
@@ -167,5 +172,7 @@ if args[:2]==['pr','view']:
 sys.exit(2)
 '''
   self.bin.joinpath('gh').write_text(gh); self.bin.joinpath('gh').chmod(0o755)
+ def test_github_open_claim_waits_without_push(self):
+  r=self.run_pr('prfix_claim_open'); self.assertEqual(r.returncode,0,r.stderr); self.assertEqual(self.git('rev-parse','refs/heads/feat/issue-906',cwd=self.origin).strip(),self.head); self.assertIn('## 判断待ち',self.comments()); self.assertNotIn('着手: codex',self.comments())
  def test_github_existing_pr(self):
   r=self.run_pr('prfix_ok'); self.assertEqual(r.returncode,0,r.stderr); new=self.git('rev-parse','refs/heads/feat/issue-906',cwd=self.origin).strip(); self.assertNotEqual(new,self.head); self.git('merge-base','--is-ancestor',self.head,new,cwd=self.origin)
