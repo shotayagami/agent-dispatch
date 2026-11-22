@@ -250,6 +250,7 @@ review() {  # review <PR 番号> <PR の基準ブランチ> <作業ツリーに�
   if git show "origin/$2:REVIEW.md" > .agent-review-rules.md 2>/dev/null; then
     rules=$'\n'"- .agent-review-rules.md (origin/$2 の REVIEW.md) に書かれた観点に従う。"
   else rm -f .agent-review-rules.md; fi
+  local review_bash='- Bash で実行できるのは git status / git log / git show / git grep / git diff / git ls-files / ls / cat だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は git show または cat、検索は git grep で読む。'
   local RPROMPT="作業ディレクトリは $REPO の PR #$1 の作業ツリーです。$3 .agent-diff.patch に PR の差分があります。
 差分をレビューし、結果を .agent-review.md に Write で日本語で書いてください。PR への投稿は呼び出し側が行います。
 
@@ -260,8 +261,12 @@ review() {  # review <PR 番号> <PR の基準ブランチ> <作業ツリーに�
 - 指摘は重い順に、ファイルと行、何が起きるかを具体的に書く。確かめられなかったことは推測で埋めず、その旨を書く。
 - 冒頭に「## レビュー」と見出しを付け、最後に「判定: 問題なし / 要修正」のどちらかを書く。
 - ファイルは読むだけにし、.agent-review.md 以外は作成も編集もしない。
-- Bash で実行できるのは git status / git log / git show / git grep / git diff / git ls-files / ls / cat だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は git show または cat、検索は git grep で読む。"
-  local reviewer='' codex_prompt
+$review_bash"
+  local reviewer='' codex_prompt claude_prompt claude_bash
+  # Claude の Bash に cat を許すと作業ディレクトリの外も読める (--restricted は Bash に効かない)。中身は Read で読ませる。
+  # 置換後の文字列は引用符で囲む (bash 5.2 は囲まない & を一致した部分に展開する)
+  claude_bash='- Bash で実行できるのは git status / git log / git show / git grep / git diff / git ls-files / ls だけで、1 回の呼び出しに 1 つのコマンドを書く (; や && や | でつなぐと、全体が拒否される)。ファイルの中身は Read または git show、検索は Grep または git grep で読む。'
+  claude_prompt="${RPROMPT/"$review_bash"/"$claude_bash"}"
   codex_prompt="${RPROMPT/結果を .agent-review.md に Write で日本語で書いてください。/結果の本文だけを日本語で最終回答として出力してください。}"
   codex_prompt+=$'\nファイルを作成・変更せず、提示済みの .agent-diff.patch を差分の基準として読んでください。'
   # 先の AI が利用上限などで使えなければ、もう片方に切り替える。実装と同じ AI になったときは下で注記する。
@@ -272,9 +277,9 @@ review() {  # review <PR 番号> <PR の基準ブランチ> <作業ツリーに�
     if [[ $ai == codex ]]; then
       codex_readonly 8m "$PWD/.agent-review.md" "$codex_prompt" && [[ -s .agent-review.md ]] && { reviewer=codex; break; }
     else
-      claude_models 8m review_clean "${CLAUDE_MODELS[@]}" -- -p "$RPROMPT" --restricted --strict-mcp-config \
+      claude_models 8m review_clean "${CLAUDE_MODELS[@]}" -- -p "$claude_prompt" --restricted --strict-mcp-config \
         --tools "Bash,Read,Grep,Glob,Write,Skill" \
-        --allowedTools "Read Grep Glob Write Skill Bash(git log:*) Bash(git show:*) Bash(git grep:*) Bash(git diff:*) Bash(git ls-files:*) Bash(ls:*)" \
+        --allowedTools "Read Grep Glob Write Skill Bash(git status:*) Bash(git log:*) Bash(git show:*) Bash(git grep:*) Bash(git diff:*) Bash(git ls-files:*) Bash(ls:*)" \
         --permission-mode dontAsk --max-budget-usd 3 && [[ -s .agent-review.md ]] && { reviewer=claude; break; }
     fi
     review_clean && unavailable "$AI_RC" "$WORK/ai-errors" || break
