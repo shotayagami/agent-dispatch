@@ -1,6 +1,6 @@
 # agent-dispatch
 
-GitHub と Gitea の Issue や PR に付けたラベルを、cg-dev で 10 分ごとに拾い、Codex または Claude に作業を渡す仕組みです。仕組みの説明は [docs/label-workflow.md](docs/label-workflow.md) にあります。
+GitHub と Gitea の Issue や PR に付けたラベルを、実行ホストで 10 分ごとに拾い、Codex または Claude に作業を渡す仕組みです。仕組みの説明は [docs/label-workflow.md](docs/label-workflow.md) にあります。
 
 | ディレクトリ | 内容 | 配置先 |
 |---|---|---|
@@ -10,9 +10,9 @@ GitHub と Gitea の Issue や PR に付けたラベルを、cg-dev で 10 分�
 | `rules/` | 協調と判断範囲の決まり（サンプル） | `~/.claude/rules/` |
 | `agents/` | spec と impl の役割定義（サンプル） | `~/.claude/agents/` |
 
-## 実行環境（cg-dev）
+## 実行環境
 
-cg-dev は、Proxmox 上の LXC コンテナ（CT999）のホスト名です。開発とビルドに使っているコンテナで、この仕組みはその中で systemd のユーザータイマーとして動きます。
+実行ホストは Proxmox 上の LXC コンテナです。開発とビルドに使っているコンテナで、この仕組みはその中で systemd のユーザータイマーとして動きます。
 
 | 項目 | 内容 |
 |---|---|
@@ -48,7 +48,7 @@ service は PATH に nvm の node の `bin` を含めています。別の環境
 
 ## 補足
 
-2026-11-14 時点の cg-dev の内容を写したものです。パスのユーザー名は `/home/yagamin` に、コンテナの ID は `CT999` に置き換えてあります。ユーザー名がこれと違う環境では、systemd の service の絶対パスを直す必要があります。テストはこのリポジトリの `bin/` のスクリプトを読むので、直す必要はありません。認証情報は含まれていません。ntfy のトークンは `~/.env.ntfy-agent` から読みます。
+2026-11-14 時点の実行ホストの内容を写したものです。パスのユーザー名は `/home/yagamin` に置き換えてあります。ユーザー名がこれと違う環境では、systemd の service の絶対パスを直す必要があります。テストはこのリポジトリの `bin/` のスクリプトを読むので、直す必要はありません。認証情報は含まれていません。ntfy のトークンは `~/.env.ntfy-agent` から読みます。
 
 ## ライセンス
 

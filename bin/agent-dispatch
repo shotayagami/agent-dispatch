@@ -100,7 +100,7 @@ if [[ $FORGE == github && $LABEL == agent:pr-fix ]]; then gh api -X DELETE "repo
 elif [[ $FORGE == github ]]; then gh issue edit "$NUM" --repo "$REPO" --remove-label "$LABEL" >/dev/null
 else tea issues edit --login gitea-home --repo "$REPO" --remove-labels "$LABEL" "$NUM" >/dev/null; fi || { echo "ラベルを外せませんでした" >&2; exit 1; }
 # ここから先はラベルが無いので、止められたときも中断を知らせる (systemd は TimeoutStartSec で TERM を送る)
-trap 'fail "時間切れか停止の指示で止められました。ログは cg-dev の $LOG です。"' TERM INT
+trap 'fail "時間切れか停止の指示で止められました。ログは実行ホストの $LOG です。"' TERM INT
 
 # Issue の本文とコメントを issue.md に書き出す (エージェントには Issue を操作する道具を渡さない)
 # 渡すのは、この script の資格情報の持ち主 (=利用者) が書いたものだけ。公開リポジトリの他人のコメントを指示として読ませない
@@ -341,7 +341,7 @@ $SPEC_YOMI$SPEC_KEEP
   else
     if [[ ! -s .agent-spec-comment.md ]]; then rm -f .agent-spec-comment.md; fi
     if [[ -e .agent-spec-comment.md ]] || ! unavailable "$AI_RC" "$WORK/ai-errors" || ! clean_readonly_source; then
-      fail "Claude が仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
+      fail "Claude が仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは実行ホストの $LOG です。"
     fi
     echo "Claude unavailable; switching specification to Codex Luna" >>"$LOG"
     SPEC_AI=codex; WHO='codex (spec)'
@@ -355,11 +355,11 @@ $SPEC_YOMI$SPEC_KEEP
     else
       if [[ ! -s .agent-spec-comment.md ]]; then rm -f .agent-spec-comment.md; fi
       if [[ -e .agent-spec-comment.md ]] || ! unavailable "$AI_RC" "$WORK/ai-errors" || ! clean_readonly_source; then
-        fail "Claude が利用できず、Codex Luna も仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは cg-dev の $LOG です。"
+        fail "Claude が利用できず、Codex Luna も仕様を書けませんでした。途中出力があるか、利用不可を確認できないため切り替えずに停止します (rc=$AI_RC)。ログは実行ホストの $LOG です。"
       fi
       echo "Codex Luna unavailable; retrying specification with Codex Terra" >>"$LOG"
       codex_readonly 20m "$PWD/.agent-spec-comment.md" "$CODEX_PROMPT" "$SPEC_FALLBACK_MODEL" && [[ -s .agent-spec-comment.md ]] \
-        || fail "Claude、Codex Luna、Codex Terra のいずれでも仕様を書けませんでした (rc=$AI_RC)。Issue に中断を報告しました。ログは cg-dev の $LOG です。"
+        || fail "Claude、Codex Luna、Codex Terra のいずれでも仕様を書けませんでした (rc=$AI_RC)。Issue に中断を報告しました。ログは実行ホストの $LOG です。"
     fi
   fi
   # 判断待ちは別のコメントにする。仕様の末尾の 1 行だけを見て agent:impl に進まないように、文言も分ける。
