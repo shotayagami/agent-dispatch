@@ -176,6 +176,8 @@ echo "検出: $(grep -c . "$CUR") 件 / 継続: $(printf '%s' "$PERSIST" | grep 
 [[ -s "$AUNSURE" ]] && sed 's/^/  取得できなかったアラート: /' "$AUNSURE"
 [[ -s "$CUR" ]] && sed 's/^/  検出: /' "$CUR"
 
+IFAIL="$STATE/issues-fail.new"; : > "$IFAIL"   # Issue 一覧を取得できなかった repo ("forge repo")
+IFAIL_MAX="${AGENT_DETECT_IFAIL_MAX:-3}"         # この回数続けて取れなければ ntfy で知らせる (一時的な失敗では鳴らさない)
 created=0; closed=0; first_url=""; declare -A CLOSED=()   # ラベル → 閉じた Issue の「番号 TAB キー」
 # 検出が継続している repo ごとに、開いている agent-detect の Issue を引いて、作成と解消を判断する
 while read -r forge repo; do
@@ -183,8 +185,10 @@ while read -r forge repo; do
   grep -qxF "$forge $repo" "$UNSURE" && continue
   # type=issues は Gitea だけ (GitHub は issue type と解釈して 422 を返す。PR は下の jq で除く)
   q="state=open&per_page=100&limit=100"; [[ $forge == gitea ]] && q+="&type=issues"
-  issues="$(api "$forge" GET "/repos/$repo/issues?$q" 2>/dev/null)" || continue
-  jq -e type <<<"$issues" >/dev/null 2>&1 || continue
+  # 取れなかった repo は黙って飛ばさず記録する (2026-11-14〜22 に GitHub の 422 を飛ばし続け、8 日間 Issue を作れなかった)
+  if ! issues="$(api "$forge" GET "/repos/$repo/issues?$q" 2>/dev/null)" || ! jq -e 'type == "array"' <<<"$issues" >/dev/null 2>&1; then
+    echo "$forge $repo" >> "$IFAIL"; continue
+  fi
   # 開いている agent-detect の Issue: 番号 TAB マーカーのキー (GitHub の issues には PR も混ざるので除く)
   mine="$(jq -r --arg p "$TITLE_PREFIX" '.[] | select((.pull_request // null) == null and (.title | startswith($p))) | [.number, (((.body // "") | capture("<!-- agent-detect:(?<k>[^>]*?) -->")? | .k) // "")] | join("\t")' <<<"$issues")"
   # 解消: Issue のキーが今回の検出に無ければ閉じる
@@ -228,9 +232,17 @@ while read -r forge repo; do
   CLOSED=()
 done < "$CONF"
 
-echo "作成: $created 件 / 閉じた: $closed 件"
-if (( DRY )); then rm -f "$CUR" "$DETAIL" "$UNSURE"; exit 0; fi
+echo "作成: $created 件 / 閉じた: $closed 件 / Issue 一覧を取得できなかった repo: $(grep -c . "$IFAIL") 件"
+[[ -s "$IFAIL" ]] && sed 's/^/  Issue 一覧を取得できなかった: /' "$IFAIL"
+if (( DRY )); then rm -f "$CUR" "$DETAIL" "$UNSURE" "$IFAIL"; exit 0; fi
 mv "$CUR" "$STATE/current"; rm -f "$DETAIL" "$UNSURE" "$AUNSURE"
+# 連続回数 ("回数 forge repo") を数え直す。今回取れた repo は消える (0 に戻る)
+touch "$STATE/issues-fail"
+# NR == FNR は前回分が空だと今回分を読み違えるので、ファイル名で分ける
+awk 'FILENAME == ARGV[1] {c[$2 " " $3] = $1; next} {k = $1 " " $2; print c[k] + 1, k}' "$STATE/issues-fail" "$IFAIL" > "$STATE/issues-fail.tmp" && mv "$STATE/issues-fail.tmp" "$STATE/issues-fail"
+rm -f "$IFAIL"
+reach="$(awk -v m="$IFAIL_MAX" '$1 == m {print $2 " " $3}' "$STATE/issues-fail")"
+[[ -n "$reach" ]] && { agent-notify "agent-detect: Issue 一覧を $IFAIL_MAX 回続けて取得できません" "$(tr '\n' ' ' <<<"$reach")。この repo の Issue の作成と解消は止まっています。" || true; }
 (( created > 0 )) && { agent-notify "agent-detect: Issue を $created 件作成・再開" "CI 失敗・放置 PR・アラート・セキュリティの検出です。アラートには $ALERT_LABEL、セキュリティには $SEC_LABEL ラベルを付けています。" "$first_url" || true; }
 
 # アラートの Issue を claude -p に調査させる。読み取りと Issue へのコメントだけを許し、修正はしない (agent-autonomy.md の ③)
