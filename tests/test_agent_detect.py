@@ -190,6 +190,12 @@ class SecurityTest(Base):
         self.assertIn('(Critical)', w[0][2]['title']); self.assertIn('ほか 2 件', w[0][2]['body'])
         self.assertIn('-L 19201:127.0.0.1:9200', self.log_of('ssh')); self.assertIn('-O exit', self.log_of('ssh'))   # 転送を張り、閉じる
         self.assertNotIn('p\\"w', self.log_of('curl')); self.assertNotIn('pw!', self.log_of('curl'))   # 資格情報を引数に出さない
+    def test_ignored_key_is_skipped(self):
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / 'ignore').write_text('sec wz host-a pillow  # false positive\n')
+        self.put('wz', {'aggregations': {'g': {'buckets': [wz_bucket('host-a', 'pillow'), wz_bucket('host-b', 'pillow')]}}})
+        self.run_once(); self.run_once(); w = self.writes()
+        self.assertEqual(len(w), 1); self.assertIn('sec wz host-b pillow', w[0][2]['body'])
     def test_simplerisk_open_risks_only(self):
         self.put('sr', {'status': 200, 'data': {'risks': [RISK, {**RISK, 'id': 1001, 'status': 'Closed'}]}})
         self.run_once(); self.run_once(); w = self.writes()
