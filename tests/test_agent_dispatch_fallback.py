@@ -95,6 +95,10 @@ if name=='codex':
  if '-o' in args:
   out=pathlib.Path(args[args.index('-o')+1])
   out.write_text('## レビュー\n判定: 問題なし\n' if scenario.startswith('review') else '## 仕様\n- 決定: テスト\n')
+ if not readonly and scenario=='impl_decision':
+  pathlib.Path('.yomiyasu/runs').mkdir(parents=True); pathlib.Path('.yomiyasu/.gitignore').write_text('*\n')
+  pathlib.Path('.agent-impl-report.md').write_text('## 判断待ち\n- 操作: 仕様を決める\n')
+  print('{"type":"turn.completed"}'); sys.exit(0)
  if not readonly:
   pathlib.Path('feature.txt').write_text('implemented by codex\n')
   pathlib.Path('.agent-impl-report.md').write_text('## 実装の報告\n- 検証: 完了\n')
