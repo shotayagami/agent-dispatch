@@ -605,6 +605,9 @@ fi
 git ls-files -m -o -d --exclude-standard -z | sort -zu | xargs -0r git add -- 2>>"$LOG"
 if git diff --cached --quiet; then
   [[ -s .agent-impl-report.md ]] && cp .agent-impl-report.md "$WORK/report.md"
+  # 変更がないので、報告と推敲の記録はログへ移す。残すと次の着手が「途中の生成物あり」で止まる
+  mkdir -p "$LOG.files/no-change" && for f in .agent-impl-report.md .yomiyasu; do
+    [[ -e $f && ! -L $f ]] && mv "$f" "$LOG.files/no-change/" 2>>"$LOG"; done
   if grep -q '^## 判断待ち' "$WORK/report.md" 2>/dev/null; then
     fail "判断待ち: $IMPLEMENTER が実装の前に決めてほしい点を挙げました。worktree $WT を保持しています。" "$WORK/report.md"
   fi
