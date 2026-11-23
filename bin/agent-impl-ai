@@ -10,7 +10,7 @@ case "${1:-status}" in
   *) echo "使い方: agent-impl-ai [codex-only|default|status]" >&2; exit 2 ;;
 esac
 if [[ -e $F ]]; then
-  echo "impl: gpt-6.2-sol → gpt-6.2-astra → gpt-6-luna。Claude へは切り替えない"
+  echo "impl: gpt-6-luna → gpt-6.1-terra → gpt-6.2-sol → gpt-6.2-astra。Claude へは切り替えない"
 else
-  echo "impl: gpt-6.2-sol → gpt-6.2-astra → gpt-6-luna。すべて利用不可なら Claude (claude-sonnet-5-5 → claude-opus-5-5 → fable) へ切り替える"
+  echo "impl: gpt-6-luna → gpt-6.1-terra → gpt-6.2-sol → gpt-6.2-astra。すべて利用不可なら Claude (claude-sonnet-5-5 → claude-opus-5-5 → fable) へ切り替える"
 fi
