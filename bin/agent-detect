@@ -30,7 +30,8 @@ CUR="$STATE/current.new"; DETAIL="$STATE/detail.new"; UNSURE="$STATE/unsure.new"
 : > "$CUR"; : > "$DETAIL"; : > "$UNSURE"
 US=$'\x1f'
 # add_finding <key> <forge> <repo> <タイトル> <本文>   (本文は改行を \n で持ち、後で戻す)
-add_finding() { grep -qxF "$1" "$CUR" && return; echo "$1" >> "$CUR"; printf '%s\n' "$1$US$2$US$3$US$4$US$5" >> "$DETAIL"; }
+# 誤検出と判断したキーは $STATE/ignore に 1 行ずつ書いて除外する (# 以降は理由)
+add_finding() { grep -qxF "$1" "$CUR" && return; sed 's/[[:space:]]*#.*//' "$STATE/ignore" 2>/dev/null | grep -qxF "$1" && return; echo "$1" >> "$CUR"; printf '%s\n' "$1$US$2$US$3$US$4$US$5" >> "$DETAIL"; }
 
 declare -A ME
 while read -r forge repo; do
