@@ -29,8 +29,8 @@ GitHub と Gitea の Issue や PR にラベルを付けると、実行ホスト�
 
 | ラベル | 付ける先 | 担当 | 結果 |
 |---|---|---|---|
-| `agent:spec` | Issue | Claude の `claude-opus-5-5`、次に `fable`。使えなければ Codex の `gpt-6-luna`、次に `gpt-6.1-terra` | 仕様を Issue にコメントする |
-| `agent:impl` | Issue（仕様のコメントがあるもの） | Codex の `gpt-6.2-sol`。切り替えは後述 | worktree で実装し、PR を作ってレビューまで進める |
+| `agent:spec` | Issue | Claude の `claude-opus-5-5`、次に `fable`。使えなければ Codex の `gpt-6.1-terra`、`gpt-6.2-sol`、`gpt-6.2-astra` の順 | 仕様を Issue にコメントする |
+| `agent:impl` | Issue（仕様のコメントがあるもの） | Codex の `gpt-6-luna`。切り替えは後述 | worktree で実装し、PR を作ってレビューまで進める |
 | `agent:pr-fix` | 利用者が作った PR | `agent:impl` と同じ | 既存 PR のブランチに修正を push し、PR に報告する |
 | `agent:review` | 利用者が作った PR | 既定は Claude。使えなければ Codex | 差分のレビューを PR にコメントする |
 
@@ -61,7 +61,7 @@ GitHub と Gitea の Issue や PR にラベルを付けると、実行ホスト�
 1. リポジトリを `--depth 100` で clone する。
 2. Claude を `--restricted` で起動する。モデルは `claude-opus-5-5` で、利用できなければ `fable` で再試行する。MCP は読み込まず、使えるツールは Read、Grep、Glob、Skill と、仕様のファイルへの Write だけで、Bash は渡さない。時間は 20 分まで、費用の上限は 5 USD である。
 3. 書かれた仕様を、`## 仕様` の形（決定、根拠、変更対象、検証方法、リスクと未決事項、次の担当）で Issue にコメントする。人の判断が要る点は `## 判断待ち` の節に書かれ、仕様とは別のコメントで投稿される。このとき仕様の末尾には、判断が決まるまで `agent:impl` を付けないよう書き、次の担当は人にさせる。「検証方法」には、実装後に自動で実行するコマンドを ` ```verify ` の囲みに 1 行 1 コマンドで書かせる（後述の実装後の検証）。書き終えた仕様は、保存する前に yomiyasu で推敲させる。Claude は Skill ツールで呼ぶが、Bash がないので検査スクリプトは動かせず、スキルにある目視の点検で代える。Codex はスキルのファイルを読み、検査スクリプトを記録なし (`--no-record`) で動かす。見出し、項目の名前、` ```verify ` の囲みの中身、コマンド、パス、識別子、数値は変えさせない。
-4. Claude のどちらのモデルも利用できないと確認でき、途中の出力もない場合に限り、Codex `gpt-6-luna` を読み取り専用で起動する。MCP は読み込まず、web 検索も無効で、時間は 20 分までである。Luna も利用できなければ、同じ条件で Terra で再試行する。Terra も使えなければ Issue に中断を報告して止まる。
+4. Claude のどちらのモデルも利用できないと確認でき、途中の出力もない場合に限り、Codex `gpt-6.1-terra` を読み取り専用で起動する。MCP は読み込まず、web 検索も無効で、時間は 20 分までである。利用できなければ、同じ条件で `gpt-6.2-sol`、`gpt-6.2-astra` の順に再試行する。どれも使えなければ Issue に中断を報告して止まる。
 
 ### agent:impl
 
@@ -96,8 +96,8 @@ Claude は `claude-opus-5-5`（利用できなければ `fable`）を `--restric
 
 | 作業 | 既定 | 利用不可のとき |
 |---|---|---|
-| spec | Claude `claude-opus-5-5`、次に `fable` | Codex `gpt-6-luna`、次に `gpt-6.1-terra`。どれも使えなければ中断 |
-| impl | Codex `gpt-6.2-sol`、次に `gpt-6.2-astra`、`gpt-6-luna` | Claude `claude-sonnet-5-5`、`claude-opus-5-5`、`fable` の順（ファイルの読み書きだけで実装）。`impl-codex-only` が有効なら Claude には切り替えない |
+| spec | Claude `claude-opus-5-5`、次に `fable` | Codex `gpt-6.1-terra`、`gpt-6.2-sol`、`gpt-6.2-astra` の順。どれも使えなければ中断 |
+| impl | Codex `gpt-6-luna`、次に `gpt-6.1-terra`、`gpt-6.2-sol`、`gpt-6.2-astra` | Claude `claude-sonnet-5-5`、`claude-opus-5-5`、`fable` の順（ファイルの読み書きだけで実装）。`impl-codex-only` が有効なら Claude には切り替えない |
 | review（impl と pr-fix の後） | 実装していない AI。Codex が実装したときは Claude `claude-opus-5-5`、次に `fable` | もう一方の AI。どちらも使えなければ「独立レビューは未実施」と記録する |
 | review（`agent:review`） | Claude `claude-opus-5-5`、次に `fable` | Codex |
 
