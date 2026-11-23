@@ -68,6 +68,15 @@ class DetectTest(Base):
             {'number': 3, 'user': {'login': 'me'}, 'updated_at': '2999-01-01T00:00:00Z', 'html_url': 'u3', 'title': 't3'}])
         self.run_once(); self.run_once(); w = self.writes()
         self.assertEqual(len(w), 1); self.assertIn('PR #1', w[0][2]['title'])
+    def notifies(self):
+        f = pathlib.Path(f'{self.log}.notify'); return f.read_text() if f.exists() else ''
+    def test_issue_list_failure_is_reported_and_notified_once(self):
+        self.put('repos_gitea_app_issues', {'message': 'Validation Failed'})   # 配列でない応答も失敗として数える
+        out = self.run_once(); self.assertIn('Issue 一覧を取得できなかった: gitea gitea/app', out)
+        self.run_once(); self.assertNotIn('続けて取得できません', self.notifies())
+        self.run_once(); self.assertEqual(self.notifies().count('3 回続けて取得できません'), 1)
+        self.run_once(); self.assertEqual(self.notifies().count('3 回続けて取得できません'), 1)   # 4 回目は鳴らさない
+        self.issues([]); self.run_once(); self.assertEqual((self.state / 'issues-fail').read_text(), '')   # 取れたら 0 に戻る
     def test_dry_run_changes_nothing(self):
         self.run_once('--dry-run'); self.run_once('--dry-run'); self.assertEqual(self.writes(), [])
         self.assertEqual((self.state / 'current').read_text(), '')
